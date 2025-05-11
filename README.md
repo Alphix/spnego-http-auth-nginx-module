@@ -195,7 +195,7 @@ where possible.
 Windows
 -------
 
-For Windows KDC/AD environments, see the documentation[here](README.Windows.md)
+For Windows KDC/AD environments, see the documentation [here](README.Windows.md).
 
 
 Help
