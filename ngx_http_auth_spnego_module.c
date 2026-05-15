@@ -45,6 +45,7 @@
 #endif
 
 #define CCACHE_VARIABLE_NAME "krb5_cc_name"
+#define CRED_EXPORT_VARIABLE_NAME "krb5_exported_cred"
 #define SHM_ZONE_NAME "shm_zone"
 #define RENEWAL_TIME 60
 
@@ -86,7 +87,6 @@ static ngx_int_t ngx_http_auth_spnego_init(ngx_conf_t *);
 static char *ngx_conf_set_regex_array_slot(ngx_conf_t *cf, ngx_command_t *cmd,
                                            void *conf);
 #endif
-
 ngx_int_t ngx_http_auth_spnego_set_bogus_authorization(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_spnego_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_spnego_add_www_authenticate(ngx_http_request_t *r,
@@ -180,6 +180,9 @@ static ngx_http_auth_spnego_ctx_t *
 ngx_http_auth_spnego_saved_ccache(ngx_http_request_t *);
 static bool ngx_spnego_authorized_principal(ngx_http_request_t *, ngx_str_t *,
                                             ngx_http_auth_spnego_loc_conf_t *);
+static ngx_int_t ngx_http_auth_spnego_exported_cred_variable(ngx_http_request_t *,
+                                                              ngx_http_variable_value_t *,
+                                                              uintptr_t);
 
 #define SPNEGO_NGX_CONF_FLAGS                                                  \
     NGX_HTTP_MAIN_CONF                                                         \
@@ -779,6 +782,15 @@ static ngx_int_t ngx_http_auth_spnego_init(ngx_conf_t *cf) {
         return NGX_ERROR;
     }
 
+    {
+        ngx_http_variable_t *ev;
+        ngx_str_t export_var_name = ngx_string(CRED_EXPORT_VARIABLE_NAME);
+        ev = ngx_http_add_variable(cf, &export_var_name, NGX_HTTP_VAR_CHANGEABLE);
+        if (ev == NULL)
+            return NGX_ERROR;
+        ev->get_handler = ngx_http_auth_spnego_exported_cred_variable;
+    }
+
     return NGX_OK;
 }
 
@@ -1218,7 +1230,11 @@ ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
     var_value.data = (u_char *)ccname;
     var_value.len = ngx_strlen(ccname);
 
-    ngx_http_auth_spnego_set_variable(r, &var_name, &var_value);
+    if (ngx_http_auth_spnego_set_variable(r, &var_name, &var_value) != NGX_OK) {
+        spnego_log_error("failed to set $" CCACHE_VARIABLE_NAME);
+        kerr = KRB5KRB_ERR_GENERIC;
+        goto done;
+    }
 
     ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(r->pool, 0);
     if (cln == NULL) {
@@ -1274,6 +1290,69 @@ ngx_http_auth_spnego_realm_from_str(ngx_str_t s, size_t *realm_len)
     return at + 1;
 }
 
+/*
+ * get_handler for $krb5_exported_cred: lazily derive the base64-encoded GSS
+ * credential from the on-disk ccache written by store_delegated_creds().
+ * Called only when the variable is actually referenced in the nginx config.
+ */
+static ngx_int_t
+ngx_http_auth_spnego_exported_cred_variable(ngx_http_request_t *r,
+                                            ngx_http_variable_value_t *v,
+                                            uintptr_t data)
+{
+    ngx_http_auth_spnego_ctx_t *ctx;
+    krb5_context                kcontext = NULL;
+    krb5_ccache                 ccache = NULL;
+    gss_cred_id_t               gss_creds = GSS_C_NO_CREDENTIAL;
+    OM_uint32                   major_status, minor_status = 0;
+    gss_buffer_desc             token = GSS_C_EMPTY_BUFFER;
+    ngx_str_t                   raw, b64;
+
+    v->not_found = 1;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_auth_spnego_module);
+    if (ctx == NULL || ctx->ccache.len == 0)
+        return NGX_OK;
+
+    if (krb5_init_context(&kcontext)
+        || krb5_cc_resolve(kcontext, (char *)ctx->ccache.data, &ccache))
+        goto done;
+
+    major_status = gss_krb5_import_cred(&minor_status, ccache, NULL, NULL,
+                                        &gss_creds);
+    if (GSS_ERROR(major_status))
+        goto done;
+
+    major_status = gss_export_cred(&minor_status, gss_creds, &token);
+    if (GSS_ERROR(major_status))
+        goto done;
+
+    raw.data = (u_char *)token.value;
+    raw.len  = token.length;
+    b64.len  = ngx_base64_encoded_length(raw.len);
+    b64.data = ngx_pnalloc(r->pool, b64.len + 1);
+    if (b64.data == NULL)
+        goto done;
+
+    ngx_encode_base64(&b64, &raw);
+    b64.data[b64.len] = '\0';
+
+    v->data        = b64.data;
+    v->len         = b64.len;
+    v->valid       = 1;
+    v->no_cacheable = 0;
+    v->not_found   = 0;
+
+done:
+    gss_release_buffer(&minor_status, &token);
+    if (gss_creds != GSS_C_NO_CREDENTIAL)
+        gss_release_cred(&minor_status, &gss_creds);
+    if (ccache)
+        krb5_cc_close(kcontext, ccache);
+    if (kcontext)
+        krb5_free_context(kcontext);
+    return NGX_OK;
+}
 
 
 ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
@@ -1439,7 +1518,8 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         spnego_log_error("Kerberos error: Credentials failed");
         spnego_log_krb5_error(kcontext, code);
         if (code == KRB5KDC_ERR_PREAUTH_FAILED
-            || code == KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN) {
+            || code == KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN
+            || code == KRB5KRB_AP_ERR_BAD_INTEGRITY) {
             spnego_error(NGX_DECLINED);
         }
         spnego_error(NGX_ERROR);
@@ -1447,7 +1527,11 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
 
     if (alcf->delegate_credentials) {
         creds_info delegated_creds = {&creds, TYPE_KRB5_CREDS};
-        ngx_http_auth_spnego_store_delegated_creds(r, name, delegated_creds);
+        if (ngx_http_auth_spnego_store_delegated_creds(r, name,
+                                                       delegated_creds) != NGX_OK) {
+            krb5_free_cred_contents(kcontext, &creds);
+            spnego_error(NGX_ERROR);
+        }
     }
 
     krb5_free_cred_contents(kcontext, &creds);
@@ -2106,7 +2190,10 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 
         if (alcf->delegate_credentials) {
             creds_info creds = {delegated_creds, TYPE_GSS_CRED_ID_T};
-            ngx_http_auth_spnego_store_delegated_creds(r, username, creds);
+            if (ngx_http_auth_spnego_store_delegated_creds(r, username,
+                                                           creds) != NGX_OK) {
+                spnego_error(NGX_ERROR);
+            }
         }
 
         r->headers_in.user.data = (u_char *)username;
@@ -2119,6 +2206,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         }
         spnego_debug1("user is %V", &r->headers_in.user);
     }
+
 
     gss_release_buffer(&minor_status, &output_token);
     output_token = (gss_buffer_desc)GSS_C_EMPTY_BUFFER;
@@ -2382,7 +2470,11 @@ static ngx_int_t
 ngx_http_auth_spnego_basic_handler(ngx_http_request_t *r,
                                    ngx_http_auth_spnego_ctx_t *ctx,
                                    ngx_http_auth_spnego_loc_conf_t *alcf) {
-    if (NGX_OK != ngx_http_auth_spnego_basic(r, ctx, alcf)) {
+    ngx_int_t ret = ngx_http_auth_spnego_basic(r, ctx, alcf);
+    if (ret == NGX_ERROR) {
+        return (ctx->ret = NGX_HTTP_INTERNAL_SERVER_ERROR);
+    }
+    if (ret != NGX_OK) {
         spnego_debug0("Basic auth failed");
         if (ngx_http_auth_spnego_headers_basic_only(r, ctx, alcf) ==
             NGX_ERROR) {
