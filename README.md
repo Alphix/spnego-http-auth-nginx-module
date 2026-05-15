@@ -88,29 +88,70 @@ If you would like to enable GSS local name rules to rewrite usernames, you can
 specify the `auth_gss_map_to_local` option.
 
 Credential Delegation
------------------------------
+---------------------
 
-User credentials can be delegated to nginx using the `auth_gss_delegate_credentials` 
- directive. This directive will enable unconstrained delegation if the user chooses 
- to delegate their credentials. Constrained delegation (S4U2proxy) can also be enabled using the 
- `auth_gss_constrained_delegation` directive together with the `auth_gss_delegate_credentials` 
- directive. To specify the ccache file name to store the service ticket used for constrained 
- delegation, set the `auth_gss_service_ccache` directive. Otherwise, the default ccache name 
- will be used.
+User credentials can be delegated to nginx using the `auth_gss_delegate_credentials`
+directive. It accepts three values:
 
-    auth_gss_service_ccache /tmp/krb5cc_0;
+* `off` — delegation disabled (default).
+* `on` — delegated credentials are written to a temporary ccache file under the
+  system tmp directory and exposed via the `$krb5_cc_name` nginx variable.
+* `export` — delegated credentials are exported in-memory via `gss_export_cred()`,
+  base64-encoded, and exposed via the `$krb5_cred_exported` nginx variable.  No
+  file is written.  See the Security Considerations section below before using
+  this mode.
+
+Constrained delegation (S4U2Proxy) can be enabled with the
+`auth_gss_constrained_delegation` directive alongside `auth_gss_delegate_credentials`.
+`auth_gss_service_ccache` specifies the ccache file used to hold the server's own
+TGT for S4U2Proxy; if omitted, the process default ccache is used.
+
+**File-based mode** (`on`):
+
+    auth_gss_service_ccache /tmp/krb5cc_nginx;
     auth_gss_delegate_credentials on;
     auth_gss_constrained_delegation on;
-
-The delegated credentials will be stored within the systems tmp directory. Once the
- request is completed, the credentials file will be destroyed. The name of the credentials 
- file will be specified within the nginx variable `$krb5_cc_name`. Usage of the variable 
- can include passing it to a fcgi program using the `fastcgi_param` directive.
-
     fastcgi_param KRB5CCNAME $krb5_cc_name;
 
-Constrained delegation is currently only supported using the negotiate authentication scheme
- and has only been testing with MIT Kerberos (Use at your own risk if using Heimdal Kerberos).
+The delegated credentials file is destroyed once the request completes.
+
+**Export mode** (`export`):
+
+    auth_gss_service_ccache /tmp/krb5cc_nginx;
+    auth_gss_delegate_credentials export;
+    auth_gss_constrained_delegation on;
+    fastcgi_param KRB5_CRED_EXPORTED $krb5_cred_exported;
+
+No per-request file is created.  The credential blob is passed directly to the
+FastCGI backend as a base64-encoded parameter.
+
+Constrained delegation is currently only supported using the Negotiate authentication
+scheme and has only been tested with MIT Kerberos (use at your own risk with Heimdal).
+
+Security Considerations for Export Mode
+----------------------------------------
+
+Export mode eliminates the temporary ccache file under `/tmp`, removing the risk of
+credential files being read by other local processes, TOCTOU races, and orphaned
+files left behind on worker crashes.  However, it introduces its own tradeoffs:
+
+**Debug logging.**  When nginx is compiled with `--with-debug` and
+`error_log ... debug` is active, nginx logs FastCGI parameters at debug level.
+This includes `KRB5_CRED_EXPORTED`, which contains a live, base64-encoded Kerberos
+credential blob.  Anyone with access to the error log can extract and use it.
+**Do not enable debug-level logging in production when using export mode.**
+
+**Backend transport.**  The credential blob travels over the FastCGI/uwsgi/SCGI
+connection between nginx and the backend.  Use a Unix socket for this
+connection.  A cleartext TCP socket — even on loopback — allows any process on
+the host with sufficient privilege (e.g. packet capture) to intercept the
+credential.
+
+**FastCGI buffer size.**  An exported Kerberos credential is typically 2–8 KB of
+binary data, which becomes 3–11 KB when base64-encoded.  If nginx's
+`fastcgi_buffer_size` is at its default of 4 KB you may need to increase it:
+
+    fastcgi_buffer_size 16k;
 
 Basic authentication fallback
 -----------------------------
