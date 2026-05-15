@@ -105,6 +105,8 @@ Constrained delegation (S4U2Proxy) can be enabled with the
 `auth_gss_constrained_delegation` directive alongside `auth_gss_delegate_credentials`.
 `auth_gss_service_ccache` specifies the ccache file used to hold the server's own
 TGT for S4U2Proxy; if omitted, the process default ccache is used.
+`auth_gss_service_ccache_memory on` replaces the file-based service ccache with
+an in-memory ccache; see the Service Ccache section below.
 
 **File-based mode** (`on`):
 
@@ -125,8 +127,51 @@ The delegated credentials file is destroyed once the request completes.
 No per-request file is created.  The credential blob is passed directly to the
 FastCGI backend as a base64-encoded parameter.
 
+**Fully file-free mode** (export + memory service ccache):
+
+    auth_gss_service_ccache_memory on;
+    auth_gss_delegate_credentials export;
+    auth_gss_constrained_delegation on;
+    fastcgi_param KRB5_CRED_EXPORTED $krb5_cred_exported;
+
+No files are written at any point.  See the Service Credential Cache and
+Security Considerations sections below.
+
 Constrained delegation is currently only supported using the Negotiate authentication
 scheme and has only been tested with MIT Kerberos (use at your own risk with Heimdal).
+
+
+Service Credential Cache
+------------------------
+
+When `auth_gss_service_ccache_memory on` is set, the HTTP service principal's
+TGT is held in a per-worker in-memory ccache rather than a file.  The
+`auth_gss_service_ccache` file path directive is then ignored.
+
+Each nginx worker maintains one MEMORY ccache per service principal.  Because
+MEMORY ccaches are per-process (not shared between workers), each worker
+independently checks its own ccache and fetches a new TGT from the keytab when
+needed.  When a TGT expires all N workers each make one independent TGS-REQ
+rather than one worker doing it for all.  For typical TGT lifetimes (24 h) and
+worker counts (4–16), this is negligible.
+
+**Security tradeoffs.**
+
+*Improvements over file-based service ccache:*
+
+* The TGT never appears on disk; there is no file to read or steal.
+* No predictable filename for an attacker to target.
+* The TGT vanishes automatically when a worker exits — no orphaned files.
+* Per-worker isolation: a memory-disclosure exploit affecting one worker does
+  not expose the TGT of any other worker.
+
+*Considerations:*
+
+* If nginx worker processes generate core dumps (disabled by default via
+  `setrlimit(RLIMIT_CORE, 0)`) the TGT would be present in the dump.
+* On nginx restart or graceful reload every worker must fetch a fresh TGT from
+  the KDC.  With file-based ccaches a valid TGT can survive a restart.
+
 
 Security Considerations for Export Mode
 ----------------------------------------
