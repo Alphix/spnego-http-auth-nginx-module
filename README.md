@@ -116,8 +116,8 @@ using `gss_export_cred()` without exposing the ccache path.
 
 Constrained delegation (S4U2Proxy) can be enabled with the
 `auth_gss_constrained_delegation` directive alongside `auth_gss_delegate_credentials`.
-`auth_gss_service_ccache` specifies the ccache file used to hold the server's own
-TGT for S4U2Proxy; if omitted, the process default ccache is used.
+The service principal's TGT is held in a per-worker in-memory ccache (see the
+Service Ccache section below).
 
     auth_gss_delegate_credentials on;
     auth_gss_constrained_delegation on;
@@ -131,6 +131,32 @@ To pass the credential to the backend in-memory rather than exposing the ccache 
 Constrained delegation requires a GSSAPI library that supports
 `gss_acquire_cred_from()` and `gss_store_cred_into()` (MIT Kerberos; planned
 for Heimdal 8).
+
+
+Service Credential Cache
+------------------------
+
+The HTTP service principal's TGT for S4U2Proxy is held in a per-worker
+in-memory (MEMORY) ccache.  No file is ever written.
+
+Each nginx worker maintains one MEMORY ccache per service principal.  Because
+MEMORY ccaches are per-process (not shared between workers), each worker
+independently checks its own ccache and fetches a new TGT from the keytab when
+needed.  When a TGT expires all N workers each make one independent TGS-REQ
+rather than one worker doing it for all.  For typical TGT lifetimes (24 h) and
+worker counts (4–16), this is negligible.
+
+**Security properties.**
+
+* The TGT never appears on disk; there is no file to read or steal.
+* No predictable filename for an attacker to target.
+* The TGT vanishes automatically when a worker exits — no orphaned files.
+* Per-worker isolation: a memory-disclosure exploit affecting one worker does
+  not expose the TGT of any other worker.
+* If nginx worker processes generate core dumps (disabled by default via
+  `setrlimit(RLIMIT_CORE, 0)`) the TGT would be present in the dump.
+* On nginx restart or graceful reload every worker must fetch a fresh TGT from
+  the KDC.  With file-based ccaches a valid TGT can survive a restart.
 
 
 Security Considerations for $krb5_exported_cred
@@ -327,6 +353,7 @@ Important Changes
 ### v1.1.4
 
 * `$krb5_exported_cred`: new nginx variable to pass delegated Kerberos credentials in-memory to backends without writing a ccache file.
+* Constrained delegation service TGT is now held in a per-worker in-memory ccache; the `auth_gss_service_ccache` file-based directive has been removed.
 
 
 Help
