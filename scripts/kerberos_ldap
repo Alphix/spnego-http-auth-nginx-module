@@ -422,9 +422,6 @@ redirect map auth_gss_map_to_local on
 redirect delegate auth_gss_delegate_credentials on
 delegate_chain constrained auth_gss_constrained_delegation off
 delegate_chain service-empty auth_gss_service_name ""
-delegate_chain ccache-shorter auth_gss_service_ccache /tmp/krb5cc
-delegate_chain ccache-longer auth_gss_service_ccache /tmp/krb5cc_nginx2
-delegate_chain ccache-last auth_gss_service_ccache /tmp/krb5cc_nginX
 EOF
 )"
 
@@ -438,7 +435,6 @@ delegation_settings()
 		auth_gss_allow_basic_fallback off;
 		auth_gss_authorized_principal $1@${KERBEROS_REALM};
 		auth_gss_format_full on;
-		auth_gss_service_ccache /tmp/krb5cc_nginx;
 		auth_gss_delegate_credentials on;
 		auth_gss_constrained_delegation on;
 EOF
@@ -498,7 +494,6 @@ server {
                 auth_gss_format_full on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
-                auth_gss_service_ccache /tmp/krb5cc_nginx;
 	}
 
 	location /fallback.php {
@@ -513,7 +508,6 @@ server {
                 auth_gss_format_full on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
-                auth_gss_service_ccache /tmp/krb5cc_nginx;
 	}
 
 	location /delegate.php {
@@ -528,7 +522,6 @@ server {
                 auth_gss_format_full on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
-                auth_gss_service_ccache /tmp/krb5cc_nginx;
                 auth_gss_delegate_credentials on;
                 auth_gss_constrained_delegation on;
 	}
@@ -726,7 +719,6 @@ $(delegation_settings bob)
                 auth_gss_service_name HTTP/${TEST_HOST_FQDN};
                 auth_gss_allow_basic_fallback off;
                 auth_gss_format_full on;
-                auth_gss_service_ccache /tmp/krb5cc_nginx;
                 auth_gss_delegate_credentials on;
                 auth_gss_constrained_delegation on;
                 index /assigned_ccache_copy.php;
@@ -1087,7 +1079,6 @@ $(delegation_settings alice)
                 auth_gss_format_full on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
-                auth_gss_service_ccache /tmp/krb5cc_nginx;
 	}
 
 	location /regex_refused.php {
@@ -1102,7 +1093,6 @@ $(delegation_settings alice)
                 auth_gss_format_full on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
-                auth_gss_service_ccache /tmp/krb5cc_nginx;
 	}
 
 	location /short_names.php {
@@ -1117,7 +1107,6 @@ $(delegation_settings alice)
                 auth_gss_format_full off;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
-                auth_gss_service_ccache /tmp/krb5cc_nginx;
 	}
 
 	location /short_error.php {
@@ -1475,7 +1464,6 @@ server {
 	auth_gss_allow_basic_fallback off;
 	auth_gss_authorized_principal alice@${KERBEROS_REALM};
 	auth_gss_format_full on;
-	auth_gss_service_ccache /tmp/krb5cc_nginx;
 	auth_gss_delegate_credentials off;
 	set \$early_ccache \$krb5_cc_name;
 
@@ -1778,6 +1766,7 @@ sed 's/^\techo(\$who);$/\tif ($who !== "dn:uid=alice,cn=gss-spnego,cn=auth") {\n
 	/var/www/kerberos/delegate.php > /var/www/kerberos/sub_delegate.php || die
 grep -q 'dn:uid=alice,cn=gss-spnego,cn=auth' /var/www/kerberos/sub_delegate.php || die
 echo "OK"
+
 
 # For example, if php-fpm was already running when libsasl2-modules-gssapi-mit
 # was installed, it won't pick up the new GSSAPI capabilities until it has been
