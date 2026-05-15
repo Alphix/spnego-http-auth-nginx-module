@@ -105,6 +105,8 @@ Constrained delegation (S4U2Proxy) can be enabled with the
 `auth_gss_constrained_delegation` directive alongside `auth_gss_delegate_credentials`.
 `auth_gss_service_ccache` specifies the ccache file used to hold the server's own
 TGT for S4U2Proxy; if omitted, the process default ccache is used.
+`auth_gss_service_ccache_memory on` replaces the file-based service ccache with
+an in-memory ccache; see the Service Ccache section below.
 
 **File-based mode** (`on`):
 
@@ -125,8 +127,64 @@ The delegated credentials file is destroyed once the request completes.
 No per-request file is created.  The credential blob is passed directly to the
 FastCGI backend as a base64-encoded parameter.
 
+**Fully file-free mode** (export + memory service ccache):
+
+    auth_gss_service_ccache_memory on;
+    auth_gss_delegate_credentials export;
+    auth_gss_constrained_delegation on;
+    fastcgi_param KRB5_CRED_EXPORTED $krb5_cred_exported;
+
+No files are written at any point.  See the Service Ccache and Security
+Considerations sections below.
+
 Constrained delegation is currently only supported using the Negotiate authentication
 scheme and has only been tested with MIT Kerberos (use at your own risk with Heimdal).
+
+Service Ccache (`auth_gss_service_ccache_memory`)
+-------------------------------------------------
+
+When `auth_gss_service_ccache_memory on` is set, the HTTP service principal's
+TGT is held in a per-worker in-memory ccache rather than a file.  The
+`auth_gss_service_ccache` file path directive is then ignored.
+
+**Implementation.**  Each nginx worker maintains one MEMORY ccache per service
+principal, named `MEMORY:nginx_svc_<principal>` (e.g.
+`MEMORY:nginx_svc_HTTP/server.example.com@EXAMPLE.COM`).  MIT Kerberos MEMORY
+ccaches are identified by an arbitrary string; `/`, `@`, and `.` are valid in
+the name.  Naming by principal means a worker handling multiple locations with
+different service principals gets one independent MEMORY ccache per principal
+with no interference between them.
+
+Because MEMORY ccaches are per-process (not shared between workers), the
+cross-worker mutex used by the file-based path to serialise TGT refresh is
+not needed.  Each worker independently checks its own ccache and fetches a new
+TGT from the keytab when needed.  When a TGT expires all N workers each make
+one independent TGS-REQ rather than one worker doing it for all.  For typical
+TGT lifetimes (24 h) and worker counts (4–16), this is negligible.
+
+**Security tradeoffs.**
+
+*Improvements over file-based service ccache:*
+
+* The TGT never appears on disk; there is no file to read or steal.
+* No predictable filename for an attacker to target.
+* The TGT vanishes automatically when a worker exits — no orphaned files.
+* Per-worker isolation: a memory-disclosure exploit affecting one worker does
+  not expose the TGT of any other worker.
+
+*Considerations:*
+
+* If nginx worker processes generate core dumps (disabled by default via
+  `setrlimit(RLIMIT_CORE, 0)`) the TGT would be present in the dump.
+* On nginx restart or graceful reload every worker must fetch a fresh TGT from
+  the KDC.  With file-based ccaches a valid TGT can survive a restart.  If the
+  KDC is unreachable at restart time, S4U2Proxy will fail until connectivity
+  is restored.  This is an availability consideration, not a security one.
+
+The service TGT is a lower-value credential than the per-request user TGTs
+handled by `auth_gss_delegate_credentials`: it can only be used to perform
+S4U2Proxy to the services listed in `krbAllowedToDelegateTo`, not to
+impersonate arbitrary users.
 
 Security Considerations for Export Mode
 ----------------------------------------

@@ -486,6 +486,25 @@ server {
                 auth_gss_delegate_credentials export;
 	}
 
+	# Tests auth_gss_service_ccache_memory: identical to delegate.php except
+	# the service TGT lives in a per-worker MEMORY ccache instead of a file.
+	location /delegate_mem.php {
+		include snippets/fastcgi-php.conf;
+		fastcgi_pass unix:/run/php/php-fpm.sock;
+                auth_gss on;
+                auth_gss_realm ${KERBEROS_REALM};
+                auth_gss_keytab /etc/krb5.http.keytab;
+                auth_gss_service_name HTTP/${TEST_HOST_FQDN};
+                auth_gss_allow_basic_fallback off;
+                auth_gss_authorized_principal alice@${KERBEROS_REALM};
+                auth_gss_format_full on;
+                fastcgi_param HTTP_AUTHORIZATION "";
+                fastcgi_param KRB5CCNAME \$krb5_cc_name;
+                auth_gss_service_ccache_memory on;
+                auth_gss_delegate_credentials on;
+                auth_gss_constrained_delegation on;
+	}
+
 	# Channel binding directive on plain HTTP: no TLS session exists so the
 	# module must degrade gracefully and authenticate without channel bindings.
 	location /cbinding.php {
@@ -693,6 +712,62 @@ if ! cat <<'EOF' > /var/www/kerberos/export_check.php
 		exit();
 	}
 	echo("Export credentials valid for " . $_SERVER["REMOTE_USER"]);
+?>
+EOF
+then
+	die
+fi
+echo "OK"
+
+
+printf "Writing delegate_mem.php ... "
+if ! cat <<EOF > /var/www/kerberos/delegate_mem.php
+<?php
+	if (!isset(\$_SERVER["REMOTE_USER"]) || \$_SERVER["REMOTE_USER"] == "") {
+		http_response_code(500);
+		echo("REMOTE_USER not set");
+		exit();
+	}
+
+	if (!isset(\$_SERVER["KRB5CCNAME"]) || \$_SERVER["KRB5CCNAME"] == "") {
+		http_response_code(500);
+		echo("KRB5CCNAME not set");
+		exit();
+	}
+
+	putenv("KRB5CCNAME=" . \$_SERVER['KRB5CCNAME']);
+
+	\$conn = ldap_connect("ldap://${TEST_HOST_FQDN}/");
+	if (!\$conn) {
+		http_response_code(500);
+		echo("ldap_connect() failed");
+		exit();
+	}
+
+	if (!ldap_set_option(\$conn, LDAP_OPT_PROTOCOL_VERSION, 3)) {
+		http_response_code(500);
+		echo("ldap_set_option() failed");
+		exit();
+	}
+
+	\$r = ldap_sasl_bind(\$conn);
+	if (!\$r) {
+		http_response_code(500);
+		echo("ldap_sasl_bind() failed: " . ldap_error(\$conn));
+		if (ldap_get_option(\$conn, LDAP_OPT_DIAGNOSTIC_MESSAGE, \$ext_err)) {
+			echo(" (" . \$ext_err . ")");
+		}
+		exit();
+	}
+
+	\$who = ldap_exop_whoami(\$conn);
+	if (!\$who) {
+		http_response_code(500);
+		echo("ldap_exop_whoami() failed");
+		exit();
+	}
+
+	echo(\$who);
 ?>
 EOF
 then
@@ -924,6 +999,7 @@ test_path "noauth.php" 200 200
 test_path "auth.php" 401 401
 test_path "delegate.php" 401 401
 test_path "export_check.php" 401 401
+test_path "delegate_mem.php" 401 401
 
 
 echo ""
@@ -942,6 +1018,8 @@ test_path "delegate.php" 401 200
 test_ldapwhoami "alice"
 test_path "export_check.php" 401 200 "${CURL_NEGOTIATE_DELEGATE}"
 test_export_check "alice"
+test_path "delegate_mem.php" 401 200
+test_ldapwhoami "alice"
 
 
 echo ""
@@ -959,6 +1037,7 @@ test_path "noauth.php" 200 200
 test_path "auth.php" 401 403
 test_path "delegate.php" 401 403
 test_path "export_check.php" 401 403
+test_path "delegate_mem.php" 401 403
 
 
 echo ""
@@ -976,6 +1055,7 @@ test_path "noauth.php" 200 200
 test_path "auth.php" 401 403
 test_path "delegate.php" 401 403
 test_path "export_check.php" 401 403
+test_path "delegate_mem.php" 401 403
 
 
 echo ""
@@ -997,6 +1077,7 @@ kdestroy -q > /dev/null 2>&1 || true
 echo "OK"
 test_path "delegate.php" 401 401
 test_path "export_check.php" 401 401
+test_path "delegate_mem.php" 401 401
 
 
 echo ""
@@ -1012,6 +1093,7 @@ test_path "delegate.php" 401 500
 # does not affect it — the user's forwarded credential is still exported.
 test_path "export_check.php" 401 200 "${CURL_NEGOTIATE_DELEGATE}"
 test_export_check "alice"
+test_path "delegate_mem.php" 401 500
 
 
 echo ""
@@ -1025,6 +1107,7 @@ else
 fi
 test_path "delegate.php" 401 403
 test_path "export_check.php" 401 403
+test_path "delegate_mem.php" 401 403
 
 echo ""
 printf "Re-adding delegation permissions via LDAP ... "
@@ -1053,6 +1136,8 @@ test_path "delegate.php" 401 200
 test_ldapwhoami "alice"
 test_path "export_check.php" 401 200 "${CURL_NEGOTIATE_DELEGATE}"
 test_export_check "alice"
+test_path "delegate_mem.php" 401 200
+test_ldapwhoami "alice"
 
 
 echo ""
