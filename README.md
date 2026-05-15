@@ -105,29 +105,54 @@ the user gets a 401: with basic authentication fallback enabled, the browser
 prompts for a username and password.
 
 Credential Delegation
------------------------------
+---------------------
 
-User credentials can be delegated to nginx using the `auth_gss_delegate_credentials` 
- directive. This directive will enable unconstrained delegation if the user chooses 
- to delegate their credentials. Constrained delegation (S4U2proxy) can also be enabled using the 
- `auth_gss_constrained_delegation` directive together with the `auth_gss_delegate_credentials` 
- directive. To specify the ccache file name to store the service ticket used for constrained 
- delegation, set the `auth_gss_service_ccache` directive. Otherwise, the default ccache name 
- will be used.
+User credentials can be delegated to nginx using the `auth_gss_delegate_credentials`
+directive.  When enabled, the delegated credential is stored in a temporary per-request
+ccache file (destroyed once the request completes) and exposed via the `$krb5_cc_name`
+nginx variable.  The credential can also be passed to a backend in-memory via the
+`$krb5_exported_cred` nginx variable, which base64-encodes the credential on demand
+using `gss_export_cred()` without exposing the ccache path.
 
-    auth_gss_service_ccache /tmp/krb5cc_0;
+Constrained delegation (S4U2Proxy) can be enabled with the
+`auth_gss_constrained_delegation` directive alongside `auth_gss_delegate_credentials`.
+`auth_gss_service_ccache` specifies the ccache file used to hold the server's own
+TGT for S4U2Proxy; if omitted, the process default ccache is used.
+
     auth_gss_delegate_credentials on;
     auth_gss_constrained_delegation on;
-
-The delegated credentials will be stored within the systems tmp directory. Once the
- request is completed, the credentials file will be destroyed. The name of the credentials 
- file will be specified within the nginx variable `$krb5_cc_name`. Usage of the variable 
- can include passing it to a fcgi program using the `fastcgi_param` directive.
-
     fastcgi_param KRB5CCNAME $krb5_cc_name;
 
-Constrained delegation is currently only supported using the negotiate authentication scheme
- and has only been testing with MIT Kerberos (Use at your own risk if using Heimdal Kerberos).
+To pass the credential to the backend in-memory rather than exposing the ccache path:
+
+    auth_gss_delegate_credentials on;
+    fastcgi_param KRB5_EXPORTED_CRED $krb5_exported_cred;
+
+Constrained delegation requires a GSSAPI library that supports
+`gss_acquire_cred_from()` and `gss_store_cred_into()` (MIT Kerberos; planned
+for Heimdal 8).
+
+
+Security Considerations for $krb5_exported_cred
+------------------------------------------------
+
+**Debug logging.**  When nginx is compiled with `--with-debug` and
+`error_log ... debug` is active, nginx logs FastCGI parameters at debug level.
+This includes `KRB5_EXPORTED_CRED`, which contains a live, base64-encoded Kerberos
+credential blob.  Anyone with access to the error log can extract and use it.
+**Do not enable debug-level logging in production when using this variable.**
+
+**Backend transport.**  The credential blob travels over the FastCGI/uwsgi/SCGI
+connection between nginx and the backend.  Use a Unix socket for this
+connection.  A cleartext TCP socket — even on loopback — allows any process on
+the host with sufficient privilege (e.g. packet capture) to intercept the
+credential.
+
+**FastCGI buffer size.**  An exported Kerberos credential is typically 2–8 KB of
+binary data, which becomes 3–11 KB when base64-encoded.  If nginx's
+`fastcgi_buffer_size` is at its default of 4 KB you may need to increase it:
+
+    fastcgi_buffer_size 16k;
 
 Basic authentication fallback
 -----------------------------
@@ -294,6 +319,14 @@ Windows
 -------
 
 For Windows KDC/AD environments, see the documentation [here](README.Windows.md).
+
+
+Important Changes
+-----------------
+
+### v1.1.4
+
+* `$krb5_exported_cred`: new nginx variable to pass delegated Kerberos credentials in-memory to backends without writing a ccache file.
 
 
 Help
