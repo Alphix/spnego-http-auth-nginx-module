@@ -44,6 +44,7 @@
 #endif
 
 #define CCACHE_VARIABLE_NAME "krb5_cc_name"
+#define CRED_EXPORT_VARIABLE_NAME "krb5_cred_exported"
 #define SHM_ZONE_NAME "shm_zone"
 #define RENEWAL_TIME 60
 
@@ -51,6 +52,11 @@
 #define NGX_HTTP_AUTH_SPNEGO_CB_OFF       0
 #define NGX_HTTP_AUTH_SPNEGO_CB_SERVER_EP 1
 #define NGX_HTTP_AUTH_SPNEGO_CB_EXPORTER  2
+
+/* Values for the auth_gss_delegate_credentials tri-state directive. */
+#define NGX_HTTP_AUTH_SPNEGO_DELEGATE_OFF    0
+#define NGX_HTTP_AUTH_SPNEGO_DELEGATE_ON     1
+#define NGX_HTTP_AUTH_SPNEGO_DELEGATE_EXPORT 2
 
 
 #define spnego_log_krb5_error(context, code)                                   \
@@ -88,6 +94,9 @@ static char *ngx_conf_set_regex_array_slot(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_auth_spnego_set_cb_slot(ngx_conf_t *cf,
                                               ngx_command_t *cmd,
                                               void *conf);
+static char *ngx_http_auth_spnego_set_delegate_slot(ngx_conf_t *cf,
+                                                    ngx_command_t *cmd,
+                                                    void *conf);
 
 ngx_int_t ngx_http_auth_spnego_set_bogus_authorization(ngx_http_request_t *r);
 
@@ -152,7 +161,7 @@ typedef struct {
     ngx_array_t *auth_princs_regex;
 #endif
     ngx_flag_t map_to_local;
-    ngx_flag_t delegate_credentials;
+    ngx_uint_t delegate_credentials;  /* NGX_HTTP_AUTH_SPNEGO_DELEGATE_* */
     ngx_flag_t constrained_delegation;
     ngx_uint_t channel_bindings;       /* NGX_HTTP_AUTH_SPNEGO_CB_* */
 } ngx_http_auth_spnego_loc_conf_t;
@@ -216,8 +225,10 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
      ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, map_to_local), NULL},
 
-    {ngx_string("auth_gss_delegate_credentials"), SPNEGO_NGX_CONF_FLAGS,
-     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
+    {ngx_string("auth_gss_delegate_credentials"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF
+         | NGX_HTTP_LMT_CONF | NGX_CONF_TAKE1,
+     ngx_http_auth_spnego_set_delegate_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, delegate_credentials), NULL},
 
     {ngx_string("auth_gss_constrained_delegation"), SPNEGO_NGX_CONF_FLAGS,
@@ -330,7 +341,7 @@ static void *ngx_http_auth_spnego_create_loc_conf(ngx_conf_t *cf) {
     conf->auth_princs_regex = NGX_CONF_UNSET_PTR;
 #endif
     conf->map_to_local = NGX_CONF_UNSET;
-    conf->delegate_credentials = NGX_CONF_UNSET;
+    conf->delegate_credentials = NGX_CONF_UNSET_UINT;
     conf->constrained_delegation = NGX_CONF_UNSET;
     conf->channel_bindings = NGX_CONF_UNSET_UINT;
 
@@ -424,8 +435,9 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
     ngx_conf_merge_off_value(conf->map_to_local, prev->map_to_local, 0);
 
-    ngx_conf_merge_off_value(conf->delegate_credentials,
-                             prev->delegate_credentials, 0);
+    ngx_conf_merge_uint_value(conf->delegate_credentials,
+                              prev->delegate_credentials,
+                              NGX_HTTP_AUTH_SPNEGO_DELEGATE_OFF);
     ngx_conf_merge_off_value(conf->constrained_delegation,
                              prev->constrained_delegation, 0);
     ngx_conf_merge_uint_value(conf->channel_bindings,
@@ -478,7 +490,7 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
                        conf->map_to_local);
 
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
-                       "auth_spnego: delegate_credentials = %i",
+                       "auth_spnego: delegate_credentials = %ui",
                        conf->delegate_credentials);
 
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
@@ -593,6 +605,11 @@ static ngx_int_t ngx_http_auth_spnego_init(ngx_conf_t *cf) {
 
     ngx_str_t var_name = ngx_string(CCACHE_VARIABLE_NAME);
     if (ngx_http_auth_spnego_add_variable(cf, &var_name) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    ngx_str_t export_var_name = ngx_string(CRED_EXPORT_VARIABLE_NAME);
+    if (ngx_http_auth_spnego_add_variable(cf, &export_var_name) != NGX_OK) {
         return NGX_ERROR;
     }
 
@@ -986,6 +1003,132 @@ ngx_http_auth_spnego_realm_from_str(ngx_str_t s, size_t *realm_len)
     return at + 1;
 }
 
+/*
+ * Export delegated GSS credentials via gss_export_cred(), base64-encode the
+ * resulting token, and store it in the $krb5_cred_exported nginx variable so
+ * it can be forwarded to the FastCGI backend as a parameter.
+ *
+ * RFC 5588 §1 correctness note: after a successful gss_export_cred() the
+ * credential handle MAY be unusable for further GSSAPI operations (the spec
+ * says "need not be usable").  MIT Kerberos copies the data so the handle
+ * remains valid in practice, but we must not rely on that behaviour.  This
+ * function is therefore called as the last operation on delegated_creds before
+ * the caller's end: block runs gss_release_cred() — which the same RFC section
+ * explicitly requires to be accepted after a successful export.
+ */
+static ngx_int_t
+ngx_http_auth_spnego_export_delegated_creds(ngx_http_request_t *r,
+                                            gss_cred_id_t delegated_creds)
+{
+    OM_uint32 major_status, minor_status;
+    gss_buffer_desc token = GSS_C_EMPTY_BUFFER;
+    ngx_str_t raw, b64, var_name;
+
+    if (delegated_creds == GSS_C_NO_CREDENTIAL) {
+        spnego_debug0("export_delegated_creds: client did not delegate "
+                      "credentials");
+        return NGX_OK;
+    }
+
+    major_status = gss_export_cred(&minor_status, delegated_creds, &token);
+    if (GSS_ERROR(major_status)) {
+        spnego_log_error("%s", get_gss_error(r->pool, minor_status,
+                                             "gss_export_cred() failed"));
+        return NGX_ERROR;
+    }
+
+    raw.data = (u_char *)token.value;
+    raw.len  = token.length;
+
+    b64.len  = ngx_base64_encoded_length(raw.len);
+    b64.data = ngx_pcalloc(r->pool, b64.len + 1);
+    if (b64.data == NULL) {
+        gss_release_buffer(&minor_status, &token);
+        return NGX_ERROR;
+    }
+
+    ngx_encode_base64(&b64, &raw);
+    gss_release_buffer(&minor_status, &token);
+
+    var_name = (ngx_str_t)ngx_string(CRED_EXPORT_VARIABLE_NAME);
+    return ngx_http_auth_spnego_set_variable(r, &var_name, &b64);
+}
+
+/*
+ * Convert a krb5_creds (as returned by krb5_get_init_creds_password) into a
+ * gss_cred_id_t via a temporary MEMORY ccache, then export it with
+ * gss_export_cred() into $krb5_cred_exported.  This bridges the Basic-auth
+ * path into the same export mechanism used by the SPNEGO path.
+ */
+static ngx_int_t
+ngx_http_auth_spnego_export_krb5_creds(ngx_http_request_t *r,
+                                        krb5_context kcontext,
+                                        krb5_principal principal,
+                                        krb5_creds *creds)
+{
+    krb5_ccache ccache = NULL;
+    krb5_error_code kerr;
+    gss_cred_id_t gss_creds = GSS_C_NO_CREDENTIAL;
+    OM_uint32 major_status, minor_status;
+    ngx_int_t ret = NGX_ERROR;
+
+    if ((kerr = krb5_cc_new_unique(kcontext, "MEMORY", NULL, &ccache))) {
+        spnego_log_error("Kerberos error: Cannot create MEMORY ccache");
+        spnego_log_krb5_error(kcontext, kerr);
+        goto done;
+    }
+
+    if ((kerr = ngx_http_auth_spnego_store_krb5_creds(r, kcontext, principal,
+                                                       ccache, *creds)))
+        goto done;
+
+    major_status = gss_krb5_import_cred(&minor_status, ccache, NULL, NULL,
+                                         &gss_creds);
+    if (GSS_ERROR(major_status)) {
+        spnego_log_error("%s", get_gss_error(r->pool, minor_status,
+                                              "gss_krb5_import_cred() failed"));
+        goto done;
+    }
+
+    ret = ngx_http_auth_spnego_export_delegated_creds(r, gss_creds);
+
+done:
+    if (gss_creds != GSS_C_NO_CREDENTIAL)
+        gss_release_cred(&minor_status, &gss_creds);
+    if (ccache)
+        krb5_cc_destroy(kcontext, ccache);
+    return ret;
+}
+
+/*
+ * Config handler for auth_gss_delegate_credentials, which accepts three
+ * values: off, on (legacy file-based ccache), and export (in-memory
+ * gss_export_cred path).  Returning NGX_CONF_ERROR causes nginx to refuse
+ * to start, so any unrecognised value is caught at configuration time.
+ */
+static char *
+ngx_http_auth_spnego_set_delegate_slot(ngx_conf_t *cf, ngx_command_t *cmd,
+                                       void *conf)
+{
+    ngx_http_auth_spnego_loc_conf_t *alcf = conf;
+    ngx_str_t *value = cf->args->elts;
+
+    if (ngx_strcasecmp(value[1].data, (u_char *)"off") == 0) {
+        alcf->delegate_credentials = NGX_HTTP_AUTH_SPNEGO_DELEGATE_OFF;
+    } else if (ngx_strcasecmp(value[1].data, (u_char *)"on") == 0) {
+        alcf->delegate_credentials = NGX_HTTP_AUTH_SPNEGO_DELEGATE_ON;
+    } else if (ngx_strcasecmp(value[1].data, (u_char *)"export") == 0) {
+        alcf->delegate_credentials = NGX_HTTP_AUTH_SPNEGO_DELEGATE_EXPORT;
+    } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid value \"%V\" in \"%V\" directive, "
+                           "must be \"off\", \"on\", or \"export\"",
+                           &value[1], &cmd->name);
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
 
 ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
                                      ngx_http_auth_spnego_ctx_t *ctx,
@@ -1198,9 +1341,21 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         spnego_error(NGX_DECLINED);
     }
 
-    if (alcf->delegate_credentials) {
+    if (alcf->delegate_credentials == NGX_HTTP_AUTH_SPNEGO_DELEGATE_ON) {
+        /*
+         * The nginx module replaces the Authorization header with a bogus
+         * value (ngx_http_auth_spnego_set_bogus_authorization), so
+         * PHP_AUTH_PW is never the real password — the ccache is the only
+         * usable credential path for Basic-auth → IMAP delegation.
+         */
         creds_info delegated_creds = {&creds, TYPE_KRB5_CREDS};
         ngx_http_auth_spnego_store_delegated_creds(r, name, delegated_creds);
+    } else if (alcf->delegate_credentials == NGX_HTTP_AUTH_SPNEGO_DELEGATE_EXPORT) {
+        if (ngx_http_auth_spnego_export_krb5_creds(r, kcontext, client,
+                                                    &creds) != NGX_OK) {
+            krb5_free_cred_contents(kcontext, &creds);
+            spnego_error(NGX_ERROR);
+        }
     }
 
     krb5_free_cred_contents(kcontext, &creds);
@@ -1881,7 +2036,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         ngx_memcpy(username, output_token.value, output_token.length);
         username[output_token.length] = '\0';
 
-        if (alcf->delegate_credentials) {
+        if (alcf->delegate_credentials == NGX_HTTP_AUTH_SPNEGO_DELEGATE_ON) {
             creds_info creds = {delegated_creds, TYPE_GSS_CRED_ID_T};
             ngx_http_auth_spnego_store_delegated_creds(r, username, creds);
         }
@@ -1896,6 +2051,17 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         }
         spnego_debug1("user is %V", &r->headers_in.user);
     }
+
+    if (alcf->delegate_credentials == NGX_HTTP_AUTH_SPNEGO_DELEGATE_EXPORT) {
+        /* Export must be the last operation on delegated_creds before the
+         * gss_release_cred() in the end: block below (see RFC 5588 note in
+         * ngx_http_auth_spnego_export_delegated_creds). */
+        if (ngx_http_auth_spnego_export_delegated_creds(r,
+                                                        delegated_creds) != NGX_OK) {
+            spnego_error(NGX_ERROR);
+        }
+    }
+
 
     gss_release_buffer(&minor_status, &output_token);
     output_token = (gss_buffer_desc)GSS_C_EMPTY_BUFFER;

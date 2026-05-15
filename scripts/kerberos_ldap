@@ -18,6 +18,7 @@ EX=0
 CURL_OUTPUT="http_body"
 CURL_NONEGOTIATE="curl --max-time 60 --silent --fail-with-body -o ${CURL_OUTPUT}"
 CURL_NEGOTIATE="${CURL_NONEGOTIATE} --negotiate -u :"
+CURL_NEGOTIATE_DELEGATE="${CURL_NEGOTIATE} --delegation policy"
 CURL_HTTPS_NONEGOTIATE="${CURL_NONEGOTIATE} --insecure"
 CURL_HTTPS_NEGOTIATE="${CURL_NEGOTIATE} --insecure"
 HTTPS_PORT="8443"
@@ -464,6 +465,27 @@ server {
                 auth_gss_constrained_delegation on;
 	}
 
+	# Tests auth_gss_delegate_credentials export: credentials are serialised
+	# via gss_export_cred() and delivered as a FastCGI parameter rather than
+	# written to a file.  No constrained delegation is configured here; the
+	# client forwards credentials directly because +ok_as_delegate is set on
+	# the HTTP principal and curl uses its default delegation policy.
+	location /export_check.php {
+		include snippets/fastcgi-php.conf;
+		fastcgi_pass unix:/run/php/php-fpm.sock;
+                auth_gss on;
+                auth_gss_realm ${KERBEROS_REALM};
+                auth_gss_keytab /etc/krb5.http.keytab;
+                auth_gss_service_name HTTP/${TEST_HOST_FQDN};
+                auth_gss_allow_basic_fallback off;
+                auth_gss_authorized_principal alice@${KERBEROS_REALM};
+                auth_gss_format_full on;
+                fastcgi_param HTTP_AUTHORIZATION "";
+                fastcgi_param KRB5_CRED_EXPORTED \$krb5_cred_exported;
+                fastcgi_param KRB5CCNAME \$krb5_cc_name;
+                auth_gss_delegate_credentials export;
+	}
+
 	# Channel binding directive on plain HTTP: no TLS session exists so the
 	# module must degrade gracefully and authenticate without channel bindings.
 	location /cbinding.php {
@@ -646,6 +668,39 @@ fi
 echo "OK"
 
 
+printf "Writing export_check.php ... "
+if ! cat <<'EOF' > /var/www/kerberos/export_check.php
+<?php
+	if (!isset($_SERVER["REMOTE_USER"]) || $_SERVER["REMOTE_USER"] == "") {
+		http_response_code(500);
+		echo("REMOTE_USER not set");
+		exit();
+	}
+	if (!isset($_SERVER["KRB5_CRED_EXPORTED"]) || $_SERVER["KRB5_CRED_EXPORTED"] == "") {
+		http_response_code(500);
+		echo("KRB5_CRED_EXPORTED not set");
+		exit();
+	}
+	if (isset($_SERVER["KRB5CCNAME"]) && $_SERVER["KRB5CCNAME"] != "") {
+		http_response_code(500);
+		echo("KRB5CCNAME unexpectedly set in export mode: " . $_SERVER["KRB5CCNAME"]);
+		exit();
+	}
+	$blob = base64_decode($_SERVER["KRB5_CRED_EXPORTED"], true);
+	if ($blob === false || strlen($blob) == 0) {
+		http_response_code(500);
+		echo("KRB5_CRED_EXPORTED is not valid base64");
+		exit();
+	}
+	echo("Export credentials valid for " . $_SERVER["REMOTE_USER"]);
+?>
+EOF
+then
+	die
+fi
+echo "OK"
+
+
 # For example, if php-fpm was already running when libsasl2-modules-gssapi-mit
 # was installed, it won't pick up the new GSSAPI capabilities until it has been
 # restarted...so let's restart all services that might use SASL/GSSAPI in our
@@ -666,6 +721,7 @@ test_path()
 	SUBURL="$1"
 	EXPECT1="$2"
 	EXPECT2="$3"
+	CURL_NEG="${4:-${CURL_NEGOTIATE}}"
 
 	printf "curl %s, no negotiate: http status (expect %s)=" "${SUBURL}" "${EXPECT1}"
 	rm -f "${CURL_OUTPUT}"
@@ -685,7 +741,7 @@ test_path()
 
 	printf "curl %s, negotiate: http status (expect %s)=" "${SUBURL}" "${EXPECT2}"
 	rm -f "${CURL_OUTPUT}"
-	CODE="$($CURL_NEGOTIATE -w "%{http_code}" "http://${TEST_HOST_FQDN}:8080/${SUBURL}")" || true
+	CODE="$($CURL_NEG -w "%{http_code}" "http://${TEST_HOST_FQDN}:8080/${SUBURL}")" || true
 	printf "%s ... " "${CODE}"
 	if [ "$CODE" = "${EXPECT2}" ]; then
 		echo "OK"
@@ -818,6 +874,46 @@ test_ldapwhoami()
 	fi
 }
 
+test_export_check()
+{
+	EXPORT_EXPECTED="Export credentials valid for ${1}@${KERBEROS_REALM}"
+
+	printf "Export credential blob valid for %s ... " "${1}"
+	if [ -e "${CURL_OUTPUT}" ]; then
+		EXPORT_RESULT="$(cat "${CURL_OUTPUT}")"
+		if [ "${EXPORT_RESULT}" != "${EXPORT_EXPECTED}" ]; then
+			printf "%s != %s ... " "${EXPORT_RESULT}" "${EXPORT_EXPECTED}"
+			EX=1
+			echo "FAILED"
+		else
+			printf "%s ... " "${EXPORT_RESULT}"
+			echo "OK"
+		fi
+	else
+		EX=1
+		echo "FAILED"
+	fi
+}
+
+
+printf "Reject invalid auth_gss_delegate_credentials value ... "
+_TMPCONF="$(mktemp /tmp/nginx-badcfg-XXXXXX.conf)"
+cat > "${_TMPCONF}" <<BADEOF
+include /etc/nginx/modules-enabled/*.conf;
+events {}
+http { server { listen 19999; location / {
+    auth_gss on;
+    auth_gss_delegate_credentials bananas;
+} } }
+BADEOF
+if nginx -t -c "${_TMPCONF}" > /dev/null 2>&1; then
+	EX=1
+	echo "FAILED (nginx accepted invalid directive value)"
+else
+	echo "OK"
+fi
+rm -f "${_TMPCONF}"
+
 
 printf "Destroying Kerberos tickets ... "
 kdestroy -q > /dev/null 2>&1 || true
@@ -827,6 +923,7 @@ test_path "fallback.php" 401 401
 test_path "noauth.php" 200 200
 test_path "auth.php" 401 401
 test_path "delegate.php" 401 401
+test_path "export_check.php" 401 401
 
 
 echo ""
@@ -843,6 +940,8 @@ test_path "noauth.php" 200 200
 test_path "auth.php" 401 200
 test_path "delegate.php" 401 200
 test_ldapwhoami "alice"
+test_path "export_check.php" 401 200 "${CURL_NEGOTIATE_DELEGATE}"
+test_export_check "alice"
 
 
 echo ""
@@ -859,6 +958,7 @@ test_path "fallback.php" 401 403
 test_path "noauth.php" 200 200
 test_path "auth.php" 401 403
 test_path "delegate.php" 401 403
+test_path "export_check.php" 401 403
 
 
 echo ""
@@ -875,6 +975,7 @@ test_path "fallback.php" 401 200
 test_path "noauth.php" 200 200
 test_path "auth.php" 401 403
 test_path "delegate.php" 401 403
+test_path "export_check.php" 401 403
 
 
 echo ""
@@ -895,6 +996,7 @@ printf "Destroying Kerberos tickets ... "
 kdestroy -q > /dev/null 2>&1 || true
 echo "OK"
 test_path "delegate.php" 401 401
+test_path "export_check.php" 401 401
 
 
 echo ""
@@ -906,6 +1008,10 @@ else
 	echo "FAILED"
 fi
 test_path "delegate.php" 401 500
+# export_check has no constrained delegation so krbAllowedToDelegateTo removal
+# does not affect it — the user's forwarded credential is still exported.
+test_path "export_check.php" 401 200 "${CURL_NEGOTIATE_DELEGATE}"
+test_export_check "alice"
 
 
 echo ""
@@ -918,6 +1024,7 @@ else
 	echo "FAILED"
 fi
 test_path "delegate.php" 401 403
+test_path "export_check.php" 401 403
 
 echo ""
 printf "Re-adding delegation permissions via LDAP ... "
@@ -944,6 +1051,8 @@ else
 fi
 test_path "delegate.php" 401 200
 test_ldapwhoami "alice"
+test_path "export_check.php" 401 200 "${CURL_NEGOTIATE_DELEGATE}"
+test_export_check "alice"
 
 
 echo ""
