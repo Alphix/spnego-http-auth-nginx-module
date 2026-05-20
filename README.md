@@ -135,6 +135,48 @@ These options affect the operation of basic authentication:
   if one was specified by the client.
 
 
+Channel Bindings
+----------------
+
+The `auth_gss_channel_bindings` directive binds a Kerberos authentication
+exchange to the TLS session it travels over, preventing a man-in-the-middle
+from relaying a valid Negotiate token to a different server.  The directive
+has no effect on plain HTTP connections (it degrades gracefully to no
+bindings).
+
+    auth_gss_channel_bindings off;              # default – existing behaviour
+    auth_gss_channel_bindings server-end-point; # RFC 5929 – hash of server cert
+    auth_gss_channel_bindings exporter;         # RFC 9266 – TLS keying material (tech demo)
+
+**`server-end-point`** (RFC 5929) hashes the server's TLS certificate using
+the certificate's own signature algorithm (SHA-256 minimum).  This is the
+type supported by Windows EPA clients and by curl ≥ 8.10.0 when built against
+OpenSSL.  It is valid for both TLS 1.2 and TLS 1.3.
+
+**`exporter`** (RFC 9266) derives 32 bytes from the TLS keying material
+exporter with label `EXPORTER-Channel-Binding`.  RFC 9266 updates RFC 5929
+by adding this binding type as a replacement for the broken `tls-unique` type
+in SASL mechanisms; it does **not** mandate `tls-exporter` for HTTP Negotiate.
+No mainstream HTTP Negotiate client (Windows EPA/SSPI, browsers, or standard
+curl builds) implements this type.  This option is provided for
+experimentation only; do not use it in production.
+
+### Client support
+
+| Client | Supports channel bindings | Notes |
+|--------|--------------------------|-------|
+| curl ≥ 8.10.0, OpenSSL build | **Yes** (`server-end-point`) | See [curl PR #13098](https://github.com/curl/curl/pull/13098). Requires MIT Kerberos ≥ 1.19. Enabled by default. |
+| curl, GnuTLS build | No | GnuTLS exposes no `tls-server-end-point` API. Debian/Ubuntu ship the GnuTLS build as the default `curl` package; the OpenSSL build is `curl-openssl` (Debian) or `curl` compiled from source. |
+| Firefox on Linux | No | Uses [`GSS_C_NO_CHANNEL_BINDINGS`](https://bugzilla.mozilla.org/show_bug.cgi?id=563276) hard-coded in `nsAuthGSSAPI.cpp`; that bug has been open since 2010 with no scheduled fix. |
+| Chrome/Chromium on Linux | No | [`http_auth_gssapi_posix.cc`](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/http/http_auth_gssapi_posix.cc) accepts a channel bindings argument but always passes `GSS_C_NO_CHANNEL_BINDINGS`. |
+| Windows clients (IE, Edge, Chrome) | Yes (`server-end-point`) | Windows EPA sends channel bindings via SSPI automatically. |
+
+Because Firefox and Chrome on Linux do not send channel bindings, setting
+`auth_gss_channel_bindings server-end-point` will cause those browsers to
+receive **403 Forbidden** instead of authenticating.  Restrict this directive
+to deployments where all clients are known to support it (e.g. API endpoints
+accessed only by curl or Windows browsers).
+
 Troubleshooting
 ---------------
 
