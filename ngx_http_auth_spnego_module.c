@@ -429,7 +429,7 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
     ngx_conf_merge_off_value(conf->fqun, prev->fqun, 0);
     ngx_conf_merge_off_value(conf->force_realm, prev->force_realm, 0);
-    ngx_conf_merge_off_value(conf->allow_basic, prev->allow_basic, 1);
+    ngx_conf_merge_off_value(conf->allow_basic, prev->allow_basic, 0);
 
     ngx_conf_merge_ptr_value(conf->auth_princs, prev->auth_princs,
                              NGX_CONF_UNSET_PTR);

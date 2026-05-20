@@ -213,13 +213,19 @@ binary data, which becomes 3–11 KB when base64-encoded.  If nginx's
 Basic authentication fallback
 -----------------------------
 
-The module falls back to basic authentication by default if no negotiation is
-attempted by the client.  If you are using SPNEGO without SSL, it is recommended
-you disable basic authentication fallback, as the password would be sent in
-plaintext.  This is done by setting `auth_gss_allow_basic_fallback` in the
-config file.
+Basic authentication fallback is **disabled by default**.  When enabled, the
+module falls back to accepting plain Kerberos username/password credentials if
+the client does not attempt SPNEGO negotiation.
 
-    auth_gss_allow_basic_fallback off
+> **Security warning:** enabling basic fallback causes nginx to contact the KDC
+> with the user's password on every unauthenticated request.  This exposes the
+> KDC to password-spray attacks, can trigger account lockouts, and relies on
+> transport-layer encryption to protect the password in transit.  Only enable
+> it if you fully understand these risks and have TLS in place end-to-end.
+
+To enable it explicitly:
+
+    auth_gss_allow_basic_fallback on
 
 These options affect the operation of basic authentication:
 * `auth_gss_realm`: Kerberos realm name.  If this is specified, the realm is
