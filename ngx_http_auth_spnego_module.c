@@ -1601,7 +1601,7 @@ done:
 static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
     ngx_http_request_t *r, const char *service_name,
     const char *keytab_prefix_path, const char *service_ccache_prefix_path,
-    ngx_flag_t use_memory) {
+    ngx_flag_t use_memory, char **cc_name_out) {
     krb5_context kcontext = NULL;
     krb5_keytab keytab = NULL;
     krb5_ccache ccache = NULL;
@@ -1613,7 +1613,6 @@ static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
     char *tgs_principal_name = NULL;
     char cc_name_buf[1024];
     const char *cc_name = NULL;
-    OM_uint32 gss_minor;
     ngx_slab_pool_t *shpool = NULL;
     int locked = 0;
 
@@ -1765,9 +1764,12 @@ unlock:
 done:
     if (!kerr) {
         spnego_debug0("Successfully obtained server credentials");
-        /* failure is logged but not fatal: gss_acquire_cred will fail on its own */
-        if (GSS_ERROR(gss_krb5_ccache_name(&gss_minor, cc_name, NULL)))
-            spnego_log_error("gss_krb5_ccache_name() failed for %s", cc_name);
+        if (cc_name_out) {
+            size_t len = ngx_strlen(cc_name) + 1;
+            *cc_name_out = ngx_palloc(r->pool, len);
+            if (*cc_name_out)
+                ngx_memcpy(*cc_name_out, cc_name, len);
+        }
     } else {
         spnego_debug0("Failed to obtain server credentials");
     }
@@ -1933,72 +1935,67 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         return ret;
 
     spnego_debug0("GSSAPI authorizing");
-
-    major_status = gsskrb5_register_acceptor_identity(alcf->keytab_path);
-    if (GSS_ERROR(major_status)) {
-        spnego_log_error("gsskrb5_register_acceptor_identity() failed for %s",
-                         alcf->keytab_path);
-        spnego_error(NGX_ERROR);
-    }
     spnego_debug1("Use keytab %s", alcf->keytab_path);
 
-    if (alcf->srvcname.len > 0) {
-        /* if there is a specific service prinicipal set in the configuration
-         * file, we need to use it.  Otherwise, use the default of no
-         * credentials
-         */
-        service.length = alcf->srvcname.len + alcf->realm.len + 1; /* '@', no '\0' */
-        service.value = ngx_palloc(r->pool, service.length + 1);   /* +1 for '\0' */
-        if (NULL == service.value) {
-            spnego_error(NGX_ERROR);
-        }
-        ngx_snprintf(service.value, service.length + 1, "%V@%V%Z", &alcf->srvcname,
-                     &alcf->realm);
+    {
+        gss_key_value_element_desc elements[2];
+        gss_key_value_set_desc store;
+        int n = 0;
+        gss_name_t desired_name = GSS_C_NO_NAME;
+        gss_cred_usage_t usage = GSS_C_ACCEPT;
 
-        spnego_debug1("Using service principal: %s", service.value);
-        major_status =
-            gss_import_name(&minor_status, &service,
-                            (gss_OID)GSS_KRB5_NT_PRINCIPAL_NAME, &my_gss_name);
+        elements[n].key   = "keytab";
+        elements[n].value = alcf->keytab_prefix_path;
+        n++;
+
+        if (alcf->srvcname.len > 0) {
+            service.length = alcf->srvcname.len + alcf->realm.len + 1;
+            service.value = ngx_palloc(r->pool, service.length + 1);
+            if (NULL == service.value) {
+                spnego_error(NGX_ERROR);
+            }
+            ngx_snprintf(service.value, service.length + 1, "%V@%V%Z",
+                         &alcf->srvcname, &alcf->realm);
+
+            spnego_debug1("Using service principal: %s", service.value);
+            major_status = gss_import_name(&minor_status, &service,
+                               (gss_OID)GSS_KRB5_NT_PRINCIPAL_NAME,
+                               &my_gss_name);
+            if (GSS_ERROR(major_status)) {
+                spnego_log_error("%s Used service principal: %s",
+                                 get_gss_error(r->pool, minor_status,
+                                               "gss_import_name() failed"),
+                                 (u_char *)service.value);
+                spnego_error(NGX_ERROR);
+            }
+            desired_name = my_gss_name;
+
+            if (alcf->constrained_delegation) {
+                char *svc_ccache_name = NULL;
+                ngx_http_auth_spnego_obtain_server_credentials(
+                    r, (char *)service.value, alcf->keytab_prefix_path,
+                    alcf->service_ccache_prefix_path,
+                    alcf->service_ccache_memory, &svc_ccache_name);
+                if (svc_ccache_name) {
+                    elements[n].key   = "ccache";
+                    elements[n].value = svc_ccache_name;
+                    n++;
+                    usage = GSS_C_BOTH;
+                }
+            }
+        }
+
+        store.count    = n;
+        store.elements = elements;
+
+        major_status = gss_acquire_cred_from(
+            &minor_status, desired_name, GSS_C_INDEFINITE,
+            GSS_C_NO_OID_SET, usage, &store, &my_gss_creds, NULL, NULL);
         if (GSS_ERROR(major_status)) {
-            spnego_log_error("%s Used service principal: %s",
+            spnego_log_error("%s Used keytab: %s",
                              get_gss_error(r->pool, minor_status,
-                                           "gss_import_name() failed"),
-                             (u_char *)service.value);
-            spnego_error(NGX_ERROR);
-        }
-        gss_buffer_desc human_readable_gss_name = GSS_C_EMPTY_BUFFER;
-        major_status = gss_display_name(&minor_status, my_gss_name,
-                                        &human_readable_gss_name, NULL);
-
-        if (GSS_ERROR(major_status)) {
-            spnego_log_error("%s Used service principal: %s ",
-                             get_gss_error(r->pool, minor_status,
-                                           "gss_display_name() failed"),
-                             (u_char *)service.value);
-        }
-        spnego_debug2("my_gss_name %*s", human_readable_gss_name.length,
-                      human_readable_gss_name.value);
-        if (human_readable_gss_name.length) {
-            gss_release_buffer(&minor_status2, &human_readable_gss_name);
-        }
-
-        if (alcf->constrained_delegation) {
-            ngx_http_auth_spnego_obtain_server_credentials(
-                r, (char *)service.value, alcf->keytab_prefix_path,
-                alcf->service_ccache_prefix_path, alcf->service_ccache_memory);
-        }
-
-        /* Obtain credentials */
-        major_status = gss_acquire_cred(
-            &minor_status, my_gss_name, GSS_C_INDEFINITE, GSS_C_NO_OID_SET,
-            (alcf->constrained_delegation ? GSS_C_BOTH : GSS_C_ACCEPT),
-            &my_gss_creds, NULL, NULL);
-
-        if (GSS_ERROR(major_status)) {
-            spnego_log_error("%s Used service principal: %s",
-                             get_gss_error(r->pool, minor_status,
-                                           "gss_acquire_cred() failed"),
-                             (u_char *)service.value);
+                                           "gss_acquire_cred_from() failed"),
+                             alcf->keytab_prefix_path);
             spnego_error(NGX_ERROR);
         }
     }
@@ -2122,6 +2119,9 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     goto end;
 
 end:
+    if (service.value)
+        ngx_pfree(r->pool, service.value);
+
     if (output_token.length)
         gss_release_buffer(&minor_status, &output_token);
 
