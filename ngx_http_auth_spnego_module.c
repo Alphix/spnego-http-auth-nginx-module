@@ -957,7 +957,11 @@ ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
     var_value.data = (u_char *)ccname;
     var_value.len = ngx_strlen(ccname);
 
-    ngx_http_auth_spnego_set_variable(r, &var_name, &var_value);
+    if (ngx_http_auth_spnego_set_variable(r, &var_name, &var_value) != NGX_OK) {
+        spnego_log_error("failed to set $" CCACHE_VARIABLE_NAME);
+        kerr = KRB5KRB_ERR_GENERIC;
+        goto done;
+    }
 
     ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(r->pool, 0);
     if (NULL == cln) {
@@ -1361,7 +1365,11 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
          * usable credential path for Basic-auth → IMAP delegation.
          */
         creds_info delegated_creds = {&creds, TYPE_KRB5_CREDS};
-        ngx_http_auth_spnego_store_delegated_creds(r, name, delegated_creds);
+        if (ngx_http_auth_spnego_store_delegated_creds(r, name,
+                                                       delegated_creds) != NGX_OK) {
+            krb5_free_cred_contents(kcontext, &creds);
+            spnego_error(NGX_ERROR);
+        }
     } else if (alcf->delegate_credentials == NGX_HTTP_AUTH_SPNEGO_DELEGATE_EXPORT) {
         if (ngx_http_auth_spnego_export_krb5_creds(r, kcontext, client,
                                                     &creds) != NGX_OK) {
@@ -2087,7 +2095,10 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 
         if (alcf->delegate_credentials == NGX_HTTP_AUTH_SPNEGO_DELEGATE_ON) {
             creds_info creds = {delegated_creds, TYPE_GSS_CRED_ID_T};
-            ngx_http_auth_spnego_store_delegated_creds(r, username, creds);
+            if (ngx_http_auth_spnego_store_delegated_creds(r, username,
+                                                           creds) != NGX_OK) {
+                spnego_error(NGX_ERROR);
+            }
         }
 
         r->headers_in.user.data = (u_char *)username;
@@ -2190,7 +2201,11 @@ static ngx_int_t ngx_http_auth_spnego_handler(ngx_http_request_t *r) {
             /* If basic auth is enabled and basic creds are supplied
              * attempt basic auth.  If we attempt basic auth, we do
              * not fall through to real SPNEGO */
-            if (NGX_OK != ngx_http_auth_spnego_basic(r, ctx, alcf)) {
+            ret = ngx_http_auth_spnego_basic(r, ctx, alcf);
+            if (ret == NGX_ERROR) {
+                return (ctx->ret = NGX_HTTP_INTERNAL_SERVER_ERROR);
+            }
+            if (ret != NGX_OK) {
                 spnego_debug0("Basic auth failed");
                 if (NGX_ERROR ==
                     ngx_http_auth_spnego_headers_basic_only(r, ctx, alcf)) {
