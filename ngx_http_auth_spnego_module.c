@@ -1751,18 +1751,19 @@ static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
         goto unlock;
     }
 
+    if ((kerr = krb5_get_init_creds_opt_set_out_ccache(kcontext, options,
+                                                        ccache))) {
+        spnego_log_error("Kerberos error: Cannot set output ccache");
+        spnego_log_krb5_error(kcontext, kerr);
+        goto unlock;
+    }
+
     if ((kerr = krb5_get_init_creds_keytab(kcontext, &creds, principal, keytab,
                                            0, tgs_principal_name, options))) {
         spnego_log_error(
             "Kerberos error: Cannot obtain credentials for principal %s",
             principal_name);
         spnego_log_krb5_error(kcontext, kerr);
-        goto unlock;
-    }
-
-    if ((kerr = ngx_http_auth_spnego_store_krb5_creds(r, kcontext, principal,
-                                                      ccache, creds))) {
-        spnego_debug0("ngx_http_auth_spnego_store_krb5_creds() failed");
         goto unlock;
     }
 
