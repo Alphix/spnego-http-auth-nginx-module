@@ -33,7 +33,6 @@
 
 #include <gssapi/gssapi.h>
 #include <gssapi/gssapi_ext.h>
-#include <gssapi/gssapi_krb5.h>
 #include <krb5.h>
 #include <stdbool.h>
 
@@ -44,9 +43,16 @@
 #include <openssl/x509.h>
 #endif
 
+/* Both gss_acquire_cred_from() and gss_store_cred_into() must be present to
+ * enable constrained-delegation and credential-store features. */
+#if defined(NGX_HAVE_GSS_ACQUIRE_CRED_FROM) && defined(NGX_HAVE_GSS_STORE_CRED_INTO)
+# define NGX_HAVE_CRED_STORE 1
+#endif
+
 #define CCACHE_VARIABLE_NAME "krb5_cc_name"
 #define CRED_EXPORT_VARIABLE_NAME "krb5_exported_cred"
 #define RENEWAL_TIME 60
+#define BASIC_AUTH_TKT_LIFE 60  /* 1 minute; credential is discarded after password verification */
 
 /* Values for the auth_gss_channel_binding directive. */
 #define NGX_HTTP_AUTH_SPNEGO_CB_OFF       0
@@ -60,12 +66,6 @@
 #define SPNEGO_DELEG_BOTH          3
 
 
-#define spnego_log_krb5_error(context, code)                                   \
-    {                                                                          \
-        const char *___kerror = krb5_get_error_message(context, code);         \
-        spnego_debug2("Kerberos error: %d, %s", code, ___kerror);              \
-        krb5_free_error_message(context, ___kerror);                           \
-    }
 #define spnego_error(code)                                                     \
     ret = code;                                                                \
     goto end
@@ -125,12 +125,6 @@ static const char *get_gss_error(ngx_pool_t *p, OM_uint32 error_status, char *pr
 
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 
-typedef enum { TYPE_KRB5_CREDS, TYPE_GSS_CRED_ID_T } creds_type;
-
-typedef struct {
-    void *data;
-    creds_type type;
-} creds_info;
 
 /* per request */
 typedef struct {
@@ -165,9 +159,11 @@ typedef struct ngx_http_auth_spnego_loc_conf_s {
 #endif
     ngx_flag_t map_to_local;          /* map principal to local name via gss_localname() */
     ngx_uint_t delegation;            /* SPNEGO_DELEG_* */
-    gss_cred_id_t constrained_creds;  /* service TGT for S4U2Proxy */
-    ngx_uint_t channel_binding;       /* NGX_HTTP_AUTH_SPNEGO_CB_* */
     ngx_str_t deleg_ccache_dir;       /* dir for NFS-backed delegation ccaches */
+#ifdef NGX_HAVE_CRED_STORE
+    gss_cred_id_t constrained_creds;  /* service TGT for S4U2Proxy */
+#endif
+    ngx_uint_t channel_binding;       /* NGX_HTTP_AUTH_SPNEGO_CB_* */
 } ngx_http_auth_spnego_loc_conf_t;
 
 static void ngx_http_auth_spnego_strip_realm(ngx_http_request_t *,
@@ -371,7 +367,9 @@ static void *ngx_http_auth_spnego_create_loc_conf(ngx_conf_t *cf) {
 #endif
     conf->map_to_local = NGX_CONF_UNSET;
     conf->delegation = NGX_CONF_UNSET_UINT;
+#ifdef NGX_HAVE_CRED_STORE
     conf->constrained_creds = GSS_C_NO_CREDENTIAL;
+#endif
     conf->channel_binding = NGX_CONF_UNSET_UINT;
 
     return conf;
@@ -396,6 +394,19 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
                  sizeof("FILE:") + conf->keytab.len,
                  "FILE:%V%Z", &conf->keytab);
     conf->keytab_path = conf->keytab_prefix_path + (sizeof("FILE:") - 1);
+
+#ifndef NGX_HAVE_GSS_ACQUIRE_CRED_FROM
+    if (conf->keytab.len > 0
+        && ngx_strcmp(conf->keytab.data, "/etc/krb5.keytab") != 0)
+    {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "auth_gss_keytab \"%V\" cannot be honored: this "
+                           "build lacks gss_acquire_cred_from(); the default "
+                           "acceptor credential (KRB5_KTNAME or "
+                           "/etc/krb5.keytab) will be used instead",
+                           &conf->keytab);
+    }
+#endif
 
     ngx_conf_merge_str_value(conf->srvcname, prev->srvcname, "");
 
@@ -527,6 +538,7 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
             return NGX_CONF_ERROR;
         }
     }
+
 
     ngx_conf_merge_uint_value(conf->channel_binding,
                               prev->channel_binding,
@@ -1059,192 +1071,71 @@ ngx_int_t ngx_http_auth_spnego_token(ngx_http_request_t *r,
 }
 
 
-static krb5_error_code ngx_http_auth_spnego_store_krb5_creds(
-    ngx_http_request_t *r, krb5_context kcontext, krb5_principal principal,
-    krb5_ccache ccache, krb5_creds *creds) {
-    krb5_error_code kerr = 0;
 
-    if ((kerr = krb5_cc_initialize(kcontext, ccache, principal))) {
-        spnego_log_error("Kerberos error: Cannot initialize ccache");
-        spnego_log_krb5_error(kcontext, kerr);
-        return kerr;
-    }
-
-    if ((kerr = krb5_cc_store_cred(kcontext, ccache, creds))) {
-        spnego_log_error("Kerberos error: Cannot store credentials");
-        spnego_log_krb5_error(kcontext, kerr);
-        return kerr;
-    }
-
-    return kerr;
-}
-
-
-static krb5_error_code ngx_http_auth_spnego_store_gss_creds(
-    ngx_http_request_t *r, krb5_context kcontext, krb5_principal principal,
-    krb5_ccache ccache, gss_cred_id_t creds) {
-    OM_uint32 major_status, minor_status;
-    krb5_error_code kerr = 0;
-
-    if ((kerr = krb5_cc_initialize(kcontext, ccache, principal))) {
-        spnego_log_error("Kerberos error: Cannot initialize ccache");
-        spnego_log_krb5_error(kcontext, kerr);
-        return kerr;
-    }
-
-    major_status = gss_krb5_copy_ccache(&minor_status, creds, ccache);
-    if (GSS_ERROR(major_status)) {
-        spnego_log_error("%s", get_gss_error(r->pool, minor_status,
-                                             "ngx_http_auth_spnego_store_gss_creds() failed"));
-        return KRB5_CC_WRITE;
-    }
-
-    return kerr;
-}
-
-
-static void ngx_http_auth_spnego_krb5_destroy_ccache(void *data) {
-    krb5_context kcontext = NULL;
-    krb5_ccache ccache = NULL;
-    krb5_error_code kerr = 0;
-
-    char *ccname = (char *)data;
-
-    if ((kerr = krb5_init_context(&kcontext))) {
-        goto done;
-    }
-
-    if ((kerr = krb5_cc_resolve(kcontext, ccname, &ccache))) {
-        goto done;
-    }
-
-    krb5_cc_destroy(kcontext, ccache);
-done:
-    if (kcontext)
-        krb5_free_context(kcontext);
-}
-
-
-static char *
-ngx_http_auth_spnego_build_ccache_name(ngx_pool_t *pool, krb5_context kcontext,
-                                       krb5_ccache ccache)
-{
-    const char *cc_type = krb5_cc_get_type(kcontext, ccache);
-    const char *cc_name = krb5_cc_get_name(kcontext, ccache);
-    size_t size = ngx_strlen(cc_type) + 1 + ngx_strlen(cc_name) + 1;
-    char *result = ngx_palloc(pool, size);
-    if (result == NULL)
-        return NULL;
-    ngx_snprintf((u_char *)result, size, "%s:%s%Z", cc_type, cc_name);
-    return result;
-}
-
-
+#ifdef NGX_HAVE_CRED_STORE
 static ngx_int_t
 ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
                                            const char *principal_name,
-                                           creds_info delegated_creds,
+                                           gss_cred_id_t delegated_creds,
                                            const char *ccache_dir) {
-    krb5_context kcontext = NULL;
-    krb5_principal principal = NULL;
-    krb5_ccache ccache = NULL;
-    krb5_error_code kerr = 0;
-    char *ccname = NULL;
-    bool ccname_owned_by_cleanup = false;
+    OM_uint32 major_status, minor_status;
+    const char *s;
+    u_char *p, *escaped;
+    size_t elen;
+    char *ccname;
+    size_t ccname_len;
 
-    if (!delegated_creds.data) {
-        spnego_log_error(
-            "ngx_http_auth_spnego_store_delegated_creds() NULL credentials");
-        goto done;
+    /* Escape principal name for use as a filename: '~' -> '~~', '/' -> '~' */
+    elen = 0;
+    for (s = principal_name; *s; s++)
+        elen += (*s == '~') ? 2 : 1;
+    escaped = ngx_palloc(r->pool, elen + 1);
+    if (escaped == NULL) {
+        spnego_log_error("Not enough memory");
+        return NGX_ERROR;
     }
+    p = escaped;
+    for (s = principal_name; *s; s++) {
+        if (*s == '~') { *p++ = '~'; *p++ = '~'; }
+        else if (*s == '/') { *p++ = '~'; }
+        else { *p++ = *s; }
+    }
+    *p = '\0';
 
-    if ((kerr = krb5_init_context(&kcontext))) {
-        spnego_log_error("Kerberos error: Cannot initialize kerberos context");
-        spnego_log_krb5_error(kcontext, kerr);
-        goto done;
+    /* "FILE:" + ccache_dir + "/" + escaped + NUL */
+    ccname_len = 5 + ngx_strlen(ccache_dir) + 1 + elen + 1;
+    ccname = ngx_palloc(r->pool, ccname_len);
+    if (ccname == NULL) {
+        spnego_log_error("Not enough memory");
+        return NGX_ERROR;
     }
-
-    if ((kerr = krb5_parse_name(kcontext, principal_name, &principal))) {
-        spnego_log_error("Kerberos error: Cannot parse principal \"%s\"",
-                         principal_name);
-        spnego_log_krb5_error(kcontext, kerr);
-        goto done;
-    }
+    ngx_snprintf((u_char *)ccname, ccname_len, "FILE:%s/%s%Z",
+                 ccache_dir, escaped);
 
     {
-        char hint_buf[PATH_MAX];
-        const char *hint = NULL;
-        if (ccache_dir != NULL && ccache_dir[0] != '\0') {
-            ngx_snprintf((u_char *)hint_buf, sizeof(hint_buf),
-                         "%s/krb5cc_%Z", ccache_dir);
-            hint = hint_buf;
-        }
-        if ((kerr = krb5_cc_new_unique(kcontext, "FILE", hint, &ccache))) {
-            spnego_log_error("Kerberos error: Cannot create unique ccache");
-            spnego_log_krb5_error(kcontext, kerr);
-            goto done;
-        }
+        gss_key_value_element_desc elem = { "ccache", ccname };
+        gss_key_value_set_desc store = { 1, &elem };
+        major_status = gss_store_cred_into(&minor_status, delegated_creds,
+                                           GSS_C_INITIATE, GSS_C_NULL_OID,
+                                           1, 0, &store, NULL, NULL);
     }
-
-    switch (delegated_creds.type) {
-    case TYPE_GSS_CRED_ID_T:
-        kerr = ngx_http_auth_spnego_store_gss_creds(
-            r, kcontext, principal, ccache,
-            (gss_cred_id_t)delegated_creds.data);
-        break;
-    case TYPE_KRB5_CREDS:
-        kerr = ngx_http_auth_spnego_store_krb5_creds(
-            r, kcontext, principal, ccache,
-            (krb5_creds *)delegated_creds.data);
-        break;
-    default:
-        kerr = KRB5KRB_ERR_GENERIC;
-    }
-
-    if (kerr)
-        goto done;
-
-    ccname = ngx_http_auth_spnego_build_ccache_name(r->pool, kcontext, ccache);
-    if (ccname == NULL) {
-        kerr = ENOMEM;
-        goto done;
+    if (GSS_ERROR(major_status)) {
+        spnego_log_error("%s", get_gss_error(r->pool, minor_status,
+                                             "gss_store_cred_into() failed"));
+        return NGX_ERROR;
     }
 
     ngx_str_t var_name = ngx_string(CCACHE_VARIABLE_NAME);
-
-    ngx_str_t var_value = ngx_null_string;
-    var_value.data = (u_char *)ccname;
-    var_value.len = ngx_strlen(ccname);
-
+    ngx_str_t var_value = { ngx_strlen(ccname), (u_char *)ccname };
     if (ngx_http_auth_spnego_set_variable(r, &var_name, &var_value) != NGX_OK) {
         spnego_log_error("failed to set $" CCACHE_VARIABLE_NAME);
-        kerr = KRB5KRB_ERR_GENERIC;
-        goto done;
+        return NGX_ERROR;
     }
 
-    ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(r->pool, 0);
-    if (cln == NULL) {
-        kerr = ENOMEM;
-        goto done;
-    }
-
-    cln->handler = ngx_http_auth_spnego_krb5_destroy_ccache;
-    cln->data = ccname;
-    ccname_owned_by_cleanup = true;
-done:
-    if (principal)
-        krb5_free_principal(kcontext, principal);
-    if (ccache) {
-        if (ccname_owned_by_cleanup)
-            krb5_cc_close(kcontext, ccache);
-        else
-            krb5_cc_destroy(kcontext, ccache);
-    }
-    if (kcontext)
-        krb5_free_context(kcontext);
-
-    return kerr ? NGX_ERROR : NGX_OK;
+    return NGX_OK;
 }
+#endif /* NGX_HAVE_CRED_STORE */
+
 
 /*
  * Return a pointer to the start of the realm part (i.e. after the
@@ -1286,26 +1177,26 @@ ngx_http_auth_spnego_exported_cred_variable(ngx_http_request_t *r,
                                             ngx_http_variable_value_t *v,
                                             uintptr_t data)
 {
+    v->not_found = 1;
+#ifdef NGX_HAVE_CRED_STORE
     ngx_http_auth_spnego_ctx_t *ctx;
-    krb5_context                kcontext = NULL;
-    krb5_ccache                 ccache = NULL;
     gss_cred_id_t               gss_creds = GSS_C_NO_CREDENTIAL;
     OM_uint32                   major_status, minor_status = 0;
     gss_buffer_desc             token = GSS_C_EMPTY_BUFFER;
     ngx_str_t                   raw, b64;
 
-    v->not_found = 1;
-
     ctx = ngx_http_get_module_ctx(r, ngx_http_auth_spnego_module);
     if (ctx == NULL || ctx->ccache.len == 0)
         return NGX_OK;
 
-    if (krb5_init_context(&kcontext)
-        || krb5_cc_resolve(kcontext, (char *)ctx->ccache.data, &ccache))
-        goto done;
-
-    major_status = gss_krb5_import_cred(&minor_status, ccache, NULL, NULL,
-                                        &gss_creds);
+    {
+        gss_key_value_element_desc elem = { "ccache", (char *)ctx->ccache.data };
+        gss_key_value_set_desc store = { 1, &elem };
+        major_status = gss_acquire_cred_from(&minor_status, GSS_C_NO_NAME,
+                                             GSS_C_INDEFINITE, GSS_C_NO_OID_SET,
+                                             GSS_C_INITIATE, &store,
+                                             &gss_creds, NULL, NULL);
+    }
     if (GSS_ERROR(major_status))
         goto done;
 
@@ -1333,10 +1224,7 @@ done:
     gss_release_buffer(&minor_status, &token);
     if (gss_creds != GSS_C_NO_CREDENTIAL)
         gss_release_cred(&minor_status, &gss_creds);
-    if (ccache)
-        krb5_cc_close(kcontext, ccache);
-    if (kcontext)
-        krb5_free_context(kcontext);
+#endif /* NGX_HAVE_CRED_STORE */
     return NGX_OK;
 }
 
@@ -1349,39 +1237,21 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     ngx_str_t new_user;
     ngx_int_t ret = NGX_DECLINED;
 
-    krb5_context kcontext = NULL;
-    krb5_error_code code;
-    krb5_principal client = NULL;
-    krb5_principal server = NULL;
-    krb5_creds creds;
-    krb5_get_init_creds_opt *options = NULL;
+    OM_uint32 major_status, minor_status;
+    gss_name_t    client_name    = GSS_C_NO_NAME;
+    gss_name_t    service_name   = GSS_C_NO_NAME;
+    gss_name_t    src_name       = GSS_C_NO_NAME;
+    gss_cred_id_t user_cred      = GSS_C_NO_CREDENTIAL;
+    gss_cred_id_t svc_cred       = GSS_C_NO_CREDENTIAL;
+    gss_cred_id_t delegated_cred = GSS_C_NO_CREDENTIAL;
+    gss_ctx_id_t  init_ctx       = GSS_C_NO_CONTEXT;
+    gss_ctx_id_t  accept_ctx     = GSS_C_NO_CONTEXT;
+    gss_buffer_desc token     = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc reply     = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc passwd_buf = GSS_C_EMPTY_BUFFER;
     char *name = NULL;
     u_char *realm = NULL;
     size_t realm_len = 0;
-
-    code = krb5_init_context(&kcontext);
-    if (code) {
-        spnego_log_error("Kerberos error: Cannot initialize kerberos context");
-        return NGX_ERROR;
-    }
-
-    code = krb5_parse_name(kcontext, alcf->service_principal, &server);
-
-    if (code) {
-        spnego_log_error("Kerberos error:  Unable to parse service name");
-        spnego_log_krb5_error(kcontext, code);
-        spnego_error(NGX_ERROR);
-    }
-
-    code = krb5_unparse_name(kcontext, server, &name);
-    if (code) {
-        spnego_log_error("Kerberos error: Cannot unparse servicename");
-        spnego_log_krb5_error(kcontext, code);
-        spnego_error(NGX_ERROR);
-    }
-
-    free(name);
-    name = NULL;
 
     realm = ngx_http_auth_spnego_realm_from_str(r->headers_in.user, &realm_len);
     user.len = r->headers_in.user.len + 1;
@@ -1465,77 +1335,189 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     spnego_debug1("Attempting authentication with principal %s",
                   (const char *)user.data);
 
-    code = krb5_parse_name(kcontext, (const char *)user.data, &client);
-    if (code) {
-        spnego_log_error("Kerberos error: Unable to parse username");
-        spnego_debug1("username is %s.", (const char *)user.data);
-        spnego_log_krb5_error(kcontext, code);
-        spnego_error(NGX_ERROR);
-    }
-
-    memset(&creds, 0, sizeof(creds));
-
-    code = krb5_unparse_name(kcontext, client, &name);
-    if (code) {
-        spnego_log_error("Kerberos error: Cannot unparse username");
-        spnego_log_krb5_error(kcontext, code);
-        spnego_error(NGX_ERROR);
-    }
-
-    code = krb5_get_init_creds_opt_alloc(kcontext, &options);
-    if (code) {
-        spnego_log_error("Kerberos error: Cannot allocate options structure");
-        spnego_log_krb5_error(kcontext, code);
-        spnego_error(NGX_ERROR);
-    }
-
-    char *passwd = ngx_pnalloc(r->pool, r->headers_in.passwd.len + 1);
-    if (passwd == NULL) {
-        spnego_log_error("Not enough memory");
-        spnego_error(NGX_ERROR);
-    }
-    ngx_memcpy(passwd, r->headers_in.passwd.data, r->headers_in.passwd.len);
-    passwd[r->headers_in.passwd.len] = '\0';
-
-    code = krb5_get_init_creds_password(kcontext, &creds, client,
-                                        passwd, NULL,
-                                        NULL, 0, NULL, options);
-    if (code) {
-        spnego_log_error("Kerberos error: Credentials failed");
-        spnego_log_krb5_error(kcontext, code);
-        if (code == KRB5KDC_ERR_PREAUTH_FAILED
-            || code == KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN
-            || code == KRB5KRB_AP_ERR_BAD_INTEGRITY) {
-            spnego_error(NGX_DECLINED);
+    /* Import the client and service principal names */
+    {
+        gss_buffer_desc buf;
+        buf.value  = user.data;
+        buf.length = user.len - 1; /* exclude NUL terminator */
+        major_status = gss_import_name(&minor_status, &buf,
+                                       GSS_C_NO_OID,
+                                       &client_name);
+        if (GSS_ERROR(major_status)) {
+            spnego_log_error("Cannot import client name \"%s\": %s",
+                             (const char *)user.data,
+                             get_gss_error(r->pool, minor_status,
+                                           "gss_import_name() failed"));
+            spnego_error(NGX_ERROR);
         }
-        spnego_error(NGX_ERROR);
     }
-
-    if (alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED) {
-        creds_info delegated_creds = {&creds, TYPE_KRB5_CREDS};
-        if (ngx_http_auth_spnego_store_delegated_creds(r, name,
-                                                       delegated_creds,
-                                                       (char *)alcf->deleg_ccache_dir.data) != NGX_OK) {
-            krb5_free_cred_contents(kcontext, &creds);
+    {
+        gss_buffer_desc buf;
+        buf.value  = alcf->service_principal;
+        buf.length = ngx_strlen(alcf->service_principal);
+        major_status = gss_import_name(&minor_status, &buf,
+                                       GSS_C_NO_OID,
+                                       &service_name);
+        if (GSS_ERROR(major_status)) {
+            spnego_log_error("Cannot import service name \"%s\": %s",
+                             alcf->service_principal,
+                             get_gss_error(r->pool, minor_status,
+                                           "gss_import_name() failed"));
             spnego_error(NGX_ERROR);
         }
     }
 
-    krb5_free_cred_contents(kcontext, &creds);
-    /* Append Kerberos realm to $remote_user if not already present. */
+    /* Acquire a short-lived TGT for the user by presenting the password */
+    {
+        char *passwd = ngx_pnalloc(r->pool, r->headers_in.passwd.len + 1);
+        if (passwd == NULL) {
+            spnego_log_error("Not enough memory");
+            spnego_error(NGX_ERROR);
+        }
+        ngx_memcpy(passwd, r->headers_in.passwd.data, r->headers_in.passwd.len);
+        passwd[r->headers_in.passwd.len] = '\0';
+        passwd_buf.value  = passwd;
+        passwd_buf.length = r->headers_in.passwd.len;
+    }
+
+    major_status = gss_acquire_cred_with_password(&minor_status, client_name,
+                                                   &passwd_buf,
+                                                   BASIC_AUTH_TKT_LIFE,
+                                                   GSS_C_NO_OID_SET,
+                                                   GSS_C_INITIATE,
+                                                   &user_cred, NULL, NULL);
+    if (GSS_ERROR(major_status)) {
+        spnego_log_error("Basic auth failed for \"%s\": %s",
+                         (const char *)user.data,
+                         get_gss_error(r->pool, minor_status,
+                                       "gss_acquire_cred_with_password() failed"));
+        spnego_error(NGX_DECLINED);
+    }
+
+    /* Acquire the service (acceptor) credential from the keytab */
+    {
+#ifdef NGX_HAVE_GSS_ACQUIRE_CRED_FROM
+        gss_key_value_element_desc elem;
+        gss_key_value_set_desc store;
+
+        elem.key   = "keytab";
+        elem.value = alcf->keytab_prefix_path;
+        store.count    = 1;
+        store.elements = &elem;
+
+        major_status = gss_acquire_cred_from(&minor_status, service_name,
+                                              GSS_C_INDEFINITE,
+                                              GSS_C_NO_OID_SET, GSS_C_ACCEPT,
+                                              &store, &svc_cred, NULL, NULL);
+#else
+        /* No gss_acquire_cred_from() (Heimdal 7.x): fall back to the default
+         * acceptor credential.  auth_gss_keytab cannot be honored on this
+         * build; whatever GSSAPI defaults to (KRB5_KTNAME or
+         * /etc/krb5.keytab) is used.  Mirrors mod_auth_gssapi.c:282-286. */
+        major_status = gss_acquire_cred(&minor_status, service_name,
+                                        GSS_C_INDEFINITE,
+                                        GSS_C_NO_OID_SET, GSS_C_ACCEPT,
+                                        &svc_cred, NULL, NULL);
+#endif
+    }
+    if (GSS_ERROR(major_status)) {
+        spnego_log_error("Cannot acquire service credential from %s: %s",
+                         alcf->keytab_prefix_path,
+                         get_gss_error(r->pool, minor_status,
+                                       "failed to acquire acceptor credential"));
+        spnego_error(NGX_ERROR);
+    }
+
+    /* Synthetic init/accept loop: verifies the TGT against the keytab and
+     * produces a delegated_cred if GSS_C_DELEG_FLAG is requested. */
+    {
+        OM_uint32 req_flags = GSS_C_MUTUAL_FLAG;
+        if (alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED)
+            req_flags |= GSS_C_DELEG_FLAG;
+
+        major_status = gss_init_sec_context(&minor_status, user_cred, &init_ctx,
+                                            service_name, GSS_C_NO_OID,
+                                            req_flags, 0,
+                                            GSS_C_NO_CHANNEL_BINDINGS,
+                                            GSS_C_NO_BUFFER, NULL,
+                                            &token, NULL, NULL);
+        if (GSS_ERROR(major_status)) {
+            spnego_log_error("Basic auth gss_init_sec_context failed: %s",
+                             get_gss_error(r->pool, minor_status,
+                                           "gss_init_sec_context() failed"));
+            spnego_error(NGX_ERROR);
+        }
+
+        major_status = gss_accept_sec_context(&minor_status, &accept_ctx,
+                                              svc_cred, &token,
+                                              GSS_C_NO_CHANNEL_BINDINGS,
+                                              &src_name, NULL, &reply,
+                                              NULL, NULL, &delegated_cred);
+        gss_release_buffer(&minor_status, &token);
+
+        if (GSS_ERROR(major_status)) {
+            gss_release_buffer(&minor_status, &reply);
+            spnego_log_error("Basic auth credential verification failed "
+                             "(keytab %s, service %s): %s",
+                             alcf->keytab_prefix_path, alcf->service_principal,
+                             get_gss_error(r->pool, minor_status,
+                                           "gss_accept_sec_context() failed"));
+            spnego_error(NGX_ERROR);
+        }
+
+        /* Complete mutual authentication if the acceptor returned an AP-REP */
+        if (reply.length > 0) {
+            gss_buffer_desc dummy = GSS_C_EMPTY_BUFFER;
+            gss_init_sec_context(&minor_status, user_cred, &init_ctx,
+                                 service_name, GSS_C_NO_OID, req_flags, 0,
+                                 GSS_C_NO_CHANNEL_BINDINGS, &reply,
+                                 NULL, &dummy, NULL, NULL);
+            gss_release_buffer(&minor_status, &reply);
+            gss_release_buffer(&minor_status, &dummy);
+        }
+    }
+
+    /* Extract the authenticated client's canonical name */
+    {
+        gss_buffer_desc disp = GSS_C_EMPTY_BUFFER;
+        if (!GSS_ERROR(gss_display_name(&minor_status, src_name, &disp, NULL))) {
+            name = ngx_palloc(r->pool, disp.length + 1);
+            if (name != NULL) {
+                ngx_memcpy(name, disp.value, disp.length);
+                name[disp.length] = '\0';
+            }
+            gss_release_buffer(&minor_status, &disp);
+        }
+    }
+    if (name == NULL || name[0] == '\0') {
+        spnego_log_error("Cannot obtain authenticated principal name");
+        spnego_error(NGX_ERROR);
+    }
+
+
+    if ((alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED)
+        && delegated_cred != GSS_C_NO_CREDENTIAL) {
+        if (ngx_http_auth_spnego_store_delegated_creds(r, name,
+                                                       delegated_cred,
+                                                       (char *)alcf->deleg_ccache_dir.data) != NGX_OK) {
+            spnego_error(NGX_ERROR);
+        }
+    }
+
+    /* Append Kerberos realm to $remote_user if not already present */
     if (alcf->fqun &&
         !ngx_http_auth_spnego_realm_from_str(r->headers_in.user, NULL)) {
         const char *realm_at = strrchr(name, '@');
-        const char *realm = (realm_at && realm_at[1]) ? realm_at + 1 : NULL;
-        if (realm) {
-            new_user.len = r->headers_in.user.len + 1 + ngx_strlen(realm);
+        const char *krb5realm = (realm_at && realm_at[1]) ? realm_at + 1 : NULL;
+        if (krb5realm) {
+            new_user.len = r->headers_in.user.len + 1 + ngx_strlen(krb5realm);
             new_user.data = ngx_palloc(r->pool, new_user.len);
             if (new_user.data == NULL) {
                 spnego_log_error("Not enough memory");
                 spnego_error(NGX_ERROR);
             }
             ngx_snprintf(new_user.data, new_user.len, "%V@%s",
-                         &r->headers_in.user, realm);
+                         &r->headers_in.user, krb5realm);
             r->headers_in.user.data = new_user.data;
             r->headers_in.user.len = new_user.len;
         }
@@ -1550,16 +1532,26 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     ret = NGX_OK;
 
 end:
-    if (name)
-        free(name);
-    if (client)
-        krb5_free_principal(kcontext, client);
-    if (server)
-        krb5_free_principal(kcontext, server);
-    if (options)
-        krb5_get_init_creds_opt_free(kcontext, options);
-
-    krb5_free_context(kcontext);
+    if (init_ctx != GSS_C_NO_CONTEXT)
+        gss_delete_sec_context(&minor_status, &init_ctx, GSS_C_NO_BUFFER);
+    if (accept_ctx != GSS_C_NO_CONTEXT)
+        gss_delete_sec_context(&minor_status, &accept_ctx, GSS_C_NO_BUFFER);
+    if (delegated_cred != GSS_C_NO_CREDENTIAL)
+        gss_release_cred(&minor_status, &delegated_cred);
+    if (user_cred != GSS_C_NO_CREDENTIAL)
+        gss_release_cred(&minor_status, &user_cred);
+    if (svc_cred != GSS_C_NO_CREDENTIAL)
+        gss_release_cred(&minor_status, &svc_cred);
+    if (client_name != GSS_C_NO_NAME)
+        gss_release_name(&minor_status, &client_name);
+    if (service_name != GSS_C_NO_NAME)
+        gss_release_name(&minor_status, &service_name);
+    if (src_name != GSS_C_NO_NAME)
+        gss_release_name(&minor_status, &src_name);
+    gss_release_buffer(&minor_status, &token);
+    gss_release_buffer(&minor_status, &reply);
+    if (passwd_buf.value != NULL)
+        ngx_explicit_memzero(passwd_buf.value, passwd_buf.length);
 
     return ret;
 }
@@ -1638,6 +1630,7 @@ ngx_int_t ngx_http_auth_spnego_set_bogus_authorization(ngx_http_request_t *r) {
 }
 
 
+#ifdef NGX_HAVE_CRED_STORE
 static void
 ngx_http_auth_spnego_release_constrained_creds(void *data) {
     ngx_http_auth_spnego_loc_conf_t *alcf = data;
@@ -1645,7 +1638,7 @@ ngx_http_auth_spnego_release_constrained_creds(void *data) {
     if (alcf->constrained_creds != GSS_C_NO_CREDENTIAL)
         gss_release_cred(&minor_status, &alcf->constrained_creds);
 }
-
+#endif /* NGX_HAVE_CRED_STORE */
 
 
 #if (NGX_HTTP_SSL)
@@ -1784,7 +1777,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 
         spnego_debug1("Using service principal: %s", alcf->service_principal);
         major_status = gss_import_name(&minor_status, &service,
-                           (gss_OID)GSS_KRB5_NT_PRINCIPAL_NAME,
+                           GSS_C_NO_OID,
                            &my_gss_name);
         if (GSS_ERROR(major_status)) {
             spnego_log_error("%s Used service principal: %s",
@@ -1795,6 +1788,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         }
     }
 
+#ifdef NGX_HAVE_CRED_STORE
     if ((alcf->delegation & SPNEGO_DELEG_CONSTRAINED) && my_gss_name != GSS_C_NO_NAME) {
         OM_uint32 lifetime = 0;
 
@@ -1845,7 +1839,10 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         }
 
         my_gss_creds = alcf->constrained_creds;
-    } else {
+    } else
+#endif /* NGX_HAVE_CRED_STORE */
+    {
+#ifdef NGX_HAVE_GSS_ACQUIRE_CRED_FROM
         gss_key_value_element_desc elements[1];
         gss_key_value_set_desc store;
 
@@ -1857,10 +1854,17 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         major_status = gss_acquire_cred_from(
             &minor_status, my_gss_name, GSS_C_INDEFINITE,
             GSS_C_NO_OID_SET, GSS_C_ACCEPT, &store, &my_gss_creds, NULL, NULL);
+#else
+        /* No gss_acquire_cred_from() (Heimdal 7.x): fall back to the default
+         * acceptor credential.  See ngx_http_auth_spnego_basic() for notes. */
+        major_status = gss_acquire_cred(
+            &minor_status, my_gss_name, GSS_C_INDEFINITE,
+            GSS_C_NO_OID_SET, GSS_C_ACCEPT, &my_gss_creds, NULL, NULL);
+#endif
         if (GSS_ERROR(major_status)) {
             spnego_log_error("%s Used keytab: %s",
                              get_gss_error(r->pool, minor_status,
-                                           "gss_acquire_cred_from() failed"),
+                                           "failed to acquire acceptor credential"),
                              alcf->keytab_prefix_path);
             spnego_error(NGX_ERROR);
         }
@@ -1936,10 +1940,9 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 
     if (output_token.length && alcf->map_to_local) {
         /* Apply local rules to map Kerberos Principals to short names */
-        gss_OID_desc krb5_mech = *gss_mech_krb5;
         gss_release_buffer(&minor_status, &output_token);
         output_token = (gss_buffer_desc)GSS_C_EMPTY_BUFFER;
-        major_status = gss_localname(&minor_status, client_name, &krb5_mech,
+        major_status = gss_localname(&minor_status, client_name, GSS_C_NO_OID,
                                      &output_token);
         if (GSS_ERROR(major_status)) {
             spnego_log_error("%s", get_gss_error(r->pool, minor_status,
@@ -1957,10 +1960,10 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         ngx_memcpy(username, output_token.value, output_token.length);
         username[output_token.length] = '\0';
 
-        if (alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED) {
-            creds_info creds = {delegated_creds, TYPE_GSS_CRED_ID_T};
+        if ((alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED)
+            && delegated_creds != GSS_C_NO_CREDENTIAL) {
             if (ngx_http_auth_spnego_store_delegated_creds(r, username,
-                                                           creds,
+                                                           delegated_creds,
                                                            (char *)alcf->deleg_ccache_dir.data) != NGX_OK) {
                 spnego_error(NGX_ERROR);
             }
@@ -1999,7 +2002,10 @@ end:
         gss_release_name(&minor_status, &my_gss_name);
 
     if (my_gss_creds != GSS_C_NO_CREDENTIAL
-        && my_gss_creds != alcf->constrained_creds)
+#ifdef NGX_HAVE_CRED_STORE
+        && my_gss_creds != alcf->constrained_creds
+#endif
+        )
         gss_release_cred(&minor_status, &my_gss_creds);
 
     if (delegated_creds != GSS_C_NO_CREDENTIAL)
