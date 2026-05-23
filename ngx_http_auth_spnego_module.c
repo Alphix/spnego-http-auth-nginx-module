@@ -48,6 +48,7 @@
 #define CRED_EXPORT_VARIABLE_NAME "krb5_cred_exported"
 #define SHM_ZONE_NAME "shm_zone"
 #define RENEWAL_TIME 60
+#define BASIC_AUTH_TKT_LIFE 60  /* 1 minute; credential is discarded after password verification */
 
 /* Values for the auth_gss_channel_bindings directive. */
 #define NGX_HTTP_AUTH_SPNEGO_CB_OFF       0
@@ -1281,6 +1282,8 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         spnego_log_krb5_error(kcontext, code);
         spnego_error(NGX_ERROR);
     }
+
+    krb5_get_init_creds_opt_set_tkt_life(options, BASIC_AUTH_TKT_LIFE);
 
     char *passwd = ngx_pnalloc(r->pool, r->headers_in.passwd.len + 1);
     if (passwd == NULL) {
