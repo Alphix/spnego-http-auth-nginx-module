@@ -476,6 +476,7 @@ else
 fi
 
 
+
 printf "Creating nginx test site ... "
 if ! cat <<EOF > /etc/nginx/sites-available/kerberos
 # SPNEGO/Kerberos server test configuration
