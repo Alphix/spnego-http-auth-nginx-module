@@ -46,7 +46,6 @@
 
 #define CCACHE_VARIABLE_NAME "krb5_cc_name"
 #define CRED_EXPORT_VARIABLE_NAME "krb5_cred_exported"
-#define SHM_ZONE_NAME "shm_zone"
 #define RENEWAL_TIME 60
 #define BASIC_AUTH_TKT_LIFE 60  /* 1 minute; credential is discarded after password verification */
 
@@ -124,7 +123,6 @@ static const char *get_gss_error(ngx_pool_t *p, OM_uint32 error_status, char *pr
     return (char *)(ngx_pstrdup(p, &str));
 }
 
-static ngx_shm_zone_t *shm_zone;
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 
 typedef enum { TYPE_KRB5_CREDS, TYPE_GSS_CRED_ID_T } creds_type;
@@ -148,11 +146,7 @@ typedef struct {
     ngx_str_t keytab;                 /* keytab path (config value) */
     char *keytab_prefix_path;         /* "FILE:"-prefixed path, built at config time */
     char *keytab_path;                /* plain path: keytab_prefix_path + 5 */
-    ngx_str_t service_ccache;         /* FILE ccache path for service TGT */
-    char *service_ccache_prefix_path; /* "FILE:"-prefixed, built at config time;
-                                         NULL when service_ccache is not set */
     ngx_str_t srvcname;               /* service principal name override */
-    ngx_str_t shm_zone_name;          /* shared memory zone for cross-worker mutex */
     ngx_flag_t fqun;                  /* include @realm in $remote_user */
     ngx_flag_t force_realm;           /* strip/replace principal's realm */
     ngx_flag_t allow_basic;           /* allow Basic auth fallback */
@@ -164,7 +158,6 @@ typedef struct {
     ngx_uint_t delegate_credentials;  /* NGX_HTTP_AUTH_SPNEGO_DELEGATE_* */
     ngx_flag_t constrained_delegation; /* use S4U2Proxy constrained delegation */
     ngx_uint_t channel_bindings;      /* NGX_HTTP_AUTH_SPNEGO_CB_* */
-    ngx_flag_t service_ccache_memory; /* use per-worker MEMORY ccache instead of file */
 } ngx_http_auth_spnego_loc_conf_t;
 
 static void ngx_http_auth_spnego_strip_realm(ngx_http_request_t *,
@@ -196,10 +189,6 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
      NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, protect), NULL},
 
-    {ngx_string("auth_gss_zone_name"), NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1,
-     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
-     offsetof(ngx_http_auth_spnego_loc_conf_t, shm_zone_name), NULL},
-
     {ngx_string("auth_gss_realm"), SPNEGO_NGX_CONF_FLAGS, ngx_conf_set_str_slot,
      NGX_HTTP_LOC_CONF_OFFSET, offsetof(ngx_http_auth_spnego_loc_conf_t, realm),
      NULL},
@@ -207,10 +196,6 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
     {ngx_string("auth_gss_keytab"), SPNEGO_NGX_CONF_FLAGS,
      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, keytab), NULL},
-
-    {ngx_string("auth_gss_service_ccache"), SPNEGO_NGX_CONF_FLAGS,
-     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
-     offsetof(ngx_http_auth_spnego_loc_conf_t, service_ccache), NULL},
 
     {ngx_string("auth_gss_service_name"), SPNEGO_NGX_CONF_FLAGS,
      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
@@ -259,10 +244,6 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
      ngx_conf_set_enum_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, channel_bindings),
      (void *) &ngx_http_auth_spnego_cb},
-
-    {ngx_string("auth_gss_service_ccache_memory"), SPNEGO_NGX_CONF_FLAGS,
-     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
-     offsetof(ngx_http_auth_spnego_loc_conf_t, service_ccache_memory), NULL},
 
     ngx_null_command};
 
@@ -367,36 +348,8 @@ static void *ngx_http_auth_spnego_create_loc_conf(ngx_conf_t *cf) {
     conf->delegate_credentials = NGX_CONF_UNSET_UINT;
     conf->constrained_delegation = NGX_CONF_UNSET;
     conf->channel_bindings = NGX_CONF_UNSET_UINT;
-    conf->service_ccache_memory = NGX_CONF_UNSET;
 
     return conf;
-}
-
-static ngx_int_t ngx_http_auth_spnego_init_shm_zone(ngx_shm_zone_t *shm_zone,
-                                                    void *data) {
-    if (data) {
-        shm_zone->data = data;
-        return NGX_OK;
-    }
-
-    shm_zone->data = shm_zone->shm.addr;
-    return NGX_OK;
-}
-
-static ngx_int_t ngx_http_auth_spnego_create_shm_zone(ngx_conf_t *cf,
-                                                      ngx_str_t *name) {
-    if (shm_zone != NULL)
-        return NGX_OK;
-
-    shm_zone =
-        ngx_shared_memory_add(cf, name, 65536, &ngx_http_auth_spnego_module);
-    if (shm_zone == NULL) {
-        return NGX_ERROR;
-    }
-
-    shm_zone->init = ngx_http_auth_spnego_init_shm_zone;
-
-    return NGX_OK;
 }
 
 static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
@@ -406,20 +359,6 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
     /* "off" by default */
     ngx_conf_merge_off_value(conf->protect, prev->protect, 0);
-    ngx_conf_merge_str_value(conf->shm_zone_name, prev->shm_zone_name,
-                             SHM_ZONE_NAME);
-    ngx_conf_merge_off_value(conf->service_ccache_memory,
-                             prev->service_ccache_memory, 1);
-
-    if (conf->protect != 0 && !conf->service_ccache_memory) {
-        if (ngx_http_auth_spnego_create_shm_zone(cf, &conf->shm_zone_name) !=
-            NGX_OK) {
-            ngx_conf_log_error(
-                NGX_LOG_INFO, cf, 0,
-                "auth_spnego: failed to create shared memory zone");
-            return NGX_CONF_ERROR;
-        }
-    }
 
     ngx_conf_merge_str_value(conf->realm, prev->realm, "");
     ngx_conf_merge_str_value(conf->keytab, prev->keytab, "/etc/krb5.keytab");
@@ -432,18 +371,6 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
                  sizeof("FILE:") + conf->keytab.len,
                  "FILE:%V%Z", &conf->keytab);
     conf->keytab_path = conf->keytab_prefix_path + (sizeof("FILE:") - 1);
-
-    ngx_conf_merge_str_value(conf->service_ccache, prev->service_ccache, "");
-
-    if (conf->service_ccache.len) {
-        conf->service_ccache_prefix_path =
-            ngx_pnalloc(cf->pool, sizeof("FILE:") + conf->service_ccache.len);
-        if (conf->service_ccache_prefix_path == NULL)
-            return NGX_CONF_ERROR;
-        ngx_snprintf((u_char *)conf->service_ccache_prefix_path,
-                     sizeof("FILE:") + conf->service_ccache.len,
-                     "FILE:%V%Z", &conf->service_ccache);
-    }
 
     ngx_conf_merge_str_value(conf->srvcname, prev->srvcname, "");
 
@@ -476,9 +403,6 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
                        conf->realm.data, conf->realm.data);
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "auth_spnego: keytab@0x%p = %s",
                        conf->keytab.data, conf->keytab.data);
-    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
-                       "auth_spnego: service_ccache@0x%p = %s",
-                       conf->service_ccache.data, conf->service_ccache.data);
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "auth_spnego: srvcname@0x%p = %s",
                        conf->srvcname.data, conf->srvcname.data);
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "auth_spnego: fqun = %i",
@@ -524,10 +448,6 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
                        "auth_spnego: channel_bindings = %ui",
                        conf->channel_bindings);
-
-    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
-                       "auth_spnego: service_ccache_memory = %i",
-                       conf->service_ccache_memory);
 #endif
 
     return NGX_CONF_OK;
@@ -1584,8 +1504,7 @@ done:
 
 static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
     ngx_http_request_t *r, const char *service_name,
-    const char *keytab_prefix_path, const char *service_ccache_prefix_path,
-    ngx_flag_t use_memory, char **cc_name_out) {
+    const char *keytab_prefix_path, char **cc_name_out) {
     krb5_context kcontext = NULL;
     krb5_keytab keytab = NULL;
     krb5_ccache ccache = NULL;
@@ -1596,8 +1515,6 @@ static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
     char *principal_name = NULL;
     char *tgs_principal_name = NULL;
     const char *cc_name = NULL;
-    ngx_slab_pool_t *shpool = NULL;
-    int locked = 0;
 
     memset(&creds, 0, sizeof(creds));
 
@@ -1607,53 +1524,28 @@ static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
         goto done;
     }
 
-    if (use_memory) {
-        /*
-         * Per-worker MEMORY ccache named after the service principal.
-         * MIT Kerberos MEMORY ccaches live only in the worker's address
-         * space; the name (everything after "MEMORY:") is an opaque string
-         * identifier and may contain '/', '@', and '.' without restriction.
-         * Naming after the principal ensures that a worker serving multiple
-         * locations with different service principals has one independent
-         * MEMORY ccache per principal, preventing cross-location interference.
-         * No cross-worker mutex is needed: each worker manages its own.
-         */
-        size_t needed = ngx_strlen("MEMORY:nginx_svc_") + ngx_strlen(service_name) + 1;
-        char *name = ngx_palloc(r->pool, needed);
-        if (name == NULL) {
-            kerr = ENOMEM;
-            goto done;
-        }
-        ngx_snprintf((u_char *)name, needed, "MEMORY:nginx_svc_%s%Z", service_name);
-        cc_name = name;
+    /*
+     * Per-worker MEMORY ccache named after the service principal.
+     * MIT Kerberos MEMORY ccaches live only in the worker's address space;
+     * the name is an opaque string and may contain '/', '@', and '.'.
+     * Naming after the principal ensures independent ccaches per principal
+     * when a worker serves multiple locations with different service names.
+     * Each worker manages its own ccache with no cross-worker coordination.
+     */
+    size_t needed = ngx_strlen("MEMORY:nginx_svc_") + ngx_strlen(service_name) + 1;
+    char *name = ngx_palloc(r->pool, needed);
+    if (name == NULL) {
+        kerr = ENOMEM;
+        goto done;
+    }
+    ngx_snprintf((u_char *)name, needed, "MEMORY:nginx_svc_%s%Z", service_name);
+    cc_name = name;
 
-        if ((kerr = krb5_cc_resolve(kcontext, cc_name, &ccache))) {
-            spnego_log_error("Kerberos error: Cannot resolve MEMORY ccache %s",
-                             cc_name);
-            spnego_log_krb5_error(kcontext, kerr);
-            goto done;
-        }
-    } else if (service_ccache_prefix_path != NULL) {
-        cc_name = service_ccache_prefix_path;
-        if ((kerr = krb5_cc_resolve(kcontext, cc_name, &ccache))) {
-            spnego_log_error("Kerberos error: Cannot resolve ccache %s",
-                             cc_name);
-            spnego_log_krb5_error(kcontext, kerr);
-            goto done;
-        }
-    } else {
-        if ((kerr = krb5_cc_default(kcontext, &ccache))) {
-            spnego_log_error("Kerberos error: Cannot get default ccache");
-            spnego_log_krb5_error(kcontext, kerr);
-            goto done;
-        }
-        cc_name = ngx_http_auth_spnego_build_ccache_name(r->pool, kcontext,
-                                                         ccache);
-        if (cc_name == NULL) {
-            spnego_log_error("Not enough memory for default ccache name");
-            kerr = ENOMEM;
-            goto done;
-        }
+    if ((kerr = krb5_cc_resolve(kcontext, cc_name, &ccache))) {
+        spnego_log_error("Kerberos error: Cannot resolve MEMORY ccache %s",
+                         cc_name);
+        spnego_log_krb5_error(kcontext, kerr);
+        goto done;
     }
 
     if ((kerr = ngx_http_auth_spnego_verify_server_credentials(
@@ -1683,28 +1575,11 @@ static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
         goto done;
     }
 
-    if (!use_memory) {
-        /*
-         * FILE mode: lock the cross-worker mutex and verify once more before
-         * doing the KDC round-trip, so only one worker refreshes at a time.
-         * For MEMORY mode each worker owns its ccache independently so no
-         * coordination is needed.
-         */
-        shpool = (ngx_slab_pool_t *)shm_zone->shm.addr;
-        ngx_shmtx_lock(&shpool->mutex);
-        locked = 1;
-
-        kerr = ngx_http_auth_spnego_verify_server_credentials(r, kcontext,
-                                                              service_name, ccache);
-        if ((kerr != KRB5_FCC_NOFILE && kerr != KRB5KRB_AP_ERR_TKT_EXPIRED))
-            goto unlock;
-    }
-
     if ((kerr = krb5_kt_resolve(kcontext, keytab_prefix_path, &keytab))) {
         spnego_log_error("Kerberos error: Cannot resolve keytab %s",
                          keytab_prefix_path);
         spnego_log_krb5_error(kcontext, kerr);
-        goto unlock;
+        goto done;
     }
 
     spnego_debug1("Obtaining new credentials for %s", principal_name);
@@ -1712,7 +1587,7 @@ static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
     if ((kerr = krb5_get_init_creds_opt_alloc(kcontext, &options))) {
         spnego_log_error("Kerberos error: Cannot allocate options structure");
         spnego_log_krb5_error(kcontext, kerr);
-        goto unlock;
+        goto done;
     }
 
     krb5_get_init_creds_opt_set_forwardable(options, 1);
@@ -1722,14 +1597,14 @@ static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
     if (!tgs_principal_name) {
         spnego_log_error("ngx_http_auth_spnego_build_tgs_principal() failed");
         kerr = ENOMEM;
-        goto unlock;
+        goto done;
     }
 
     if ((kerr = krb5_get_init_creds_opt_set_out_ccache(kcontext, options,
                                                         ccache))) {
         spnego_log_error("Kerberos error: Cannot set output ccache");
         spnego_log_krb5_error(kcontext, kerr);
-        goto unlock;
+        goto done;
     }
 
     if ((kerr = krb5_get_init_creds_keytab(kcontext, &creds, principal, keytab,
@@ -1738,12 +1613,9 @@ static ngx_int_t ngx_http_auth_spnego_obtain_server_credentials(
             "Kerberos error: Cannot obtain credentials for principal %s",
             principal_name);
         spnego_log_krb5_error(kcontext, kerr);
-        goto unlock;
+        goto done;
     }
 
-unlock:
-    if (locked)
-        ngx_shmtx_unlock(&shpool->mutex);
 done:
     if (!kerr) {
         spnego_debug0("Successfully obtained server credentials");
@@ -1942,8 +1814,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
                 char *svc_ccache_name = NULL;
                 ngx_http_auth_spnego_obtain_server_credentials(
                     r, (char *)service.value, alcf->keytab_prefix_path,
-                    alcf->service_ccache_prefix_path,
-                    alcf->service_ccache_memory, &svc_ccache_name);
+                    &svc_ccache_name);
                 if (svc_ccache_name) {
                     elements[n].key   = "ccache";
                     elements[n].value = svc_ccache_name;
