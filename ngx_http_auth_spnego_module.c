@@ -1260,6 +1260,37 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         spnego_error(NGX_DECLINED);
     }
 
+    krb5_keytab keytab = NULL;
+    krb5_verify_init_creds_opt vic_opts;
+
+    if ((code = krb5_kt_resolve(kcontext, alcf->keytab_prefix_path, &keytab))) {
+        spnego_log_error("Kerberos error: Cannot resolve keytab %s",
+                         alcf->keytab_prefix_path);
+        spnego_log_krb5_error(kcontext, code);
+        krb5_free_cred_contents(kcontext, &creds);
+        spnego_error(NGX_ERROR);
+    }
+
+    krb5_verify_init_creds_opt_init(&vic_opts);
+#ifdef NGX_HAVE_HEIMDAL_KRB5
+    krb5_verify_init_creds_opt_set_ap_req_nofail(&vic_opts, 0);
+#else
+    krb5_verify_init_creds_opt_set_ap_req_nofail(&vic_opts, 1);
+#endif
+
+    code = krb5_verify_init_creds(kcontext, &creds, server, keytab,
+                                  NULL, &vic_opts);
+    krb5_kt_close(kcontext, keytab);
+
+    if (code) {
+        spnego_log_error("Kerberos error: Credential verification failed "
+                         "(keytab %s, service %s)",
+                         alcf->keytab_prefix_path, (char *)service.data);
+        spnego_log_krb5_error(kcontext, code);
+        krb5_free_cred_contents(kcontext, &creds);
+        spnego_error(NGX_ERROR);
+    }
+
     if (alcf->delegate_credentials == NGX_HTTP_AUTH_SPNEGO_DELEGATE_ON) {
         /*
          * The nginx module replaces the Authorization header with a bogus
