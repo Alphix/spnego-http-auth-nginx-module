@@ -745,7 +745,7 @@ ngx_int_t ngx_http_auth_spnego_token(ngx_http_request_t *r,
 
 static krb5_error_code ngx_http_auth_spnego_store_krb5_creds(
     ngx_http_request_t *r, krb5_context kcontext, krb5_principal principal,
-    krb5_ccache ccache, krb5_creds creds) {
+    krb5_ccache ccache, krb5_creds *creds) {
     krb5_error_code kerr = 0;
 
     if ((kerr = krb5_cc_initialize(kcontext, ccache, principal))) {
@@ -754,7 +754,7 @@ static krb5_error_code ngx_http_auth_spnego_store_krb5_creds(
         return kerr;
     }
 
-    if ((kerr = krb5_cc_store_cred(kcontext, ccache, &creds))) {
+    if ((kerr = krb5_cc_store_cred(kcontext, ccache, creds))) {
         spnego_log_error("Kerberos error: Cannot store credentials");
         spnego_log_krb5_error(kcontext, kerr);
         return kerr;
@@ -777,11 +777,8 @@ static krb5_error_code ngx_http_auth_spnego_store_gss_creds(
 
     major_status = gss_krb5_copy_ccache(&minor_status, creds, ccache);
     if (GSS_ERROR(major_status)) {
-        const char *gss_error =
-            get_gss_error(r->pool, minor_status,
-                          "ngx_http_auth_spnego_store_gss_creds() failed");
-        spnego_log_error("%s", gss_error);
-        spnego_debug1("%s", gss_error);
+        spnego_log_error("%s", get_gss_error(r->pool, minor_status,
+                                             "ngx_http_auth_spnego_store_gss_creds() failed"));
         return KRB5_CC_WRITE;
     }
 
@@ -837,8 +834,6 @@ ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
     if (!delegated_creds.data) {
         spnego_log_error(
             "ngx_http_auth_spnego_store_delegated_creds() NULL credentials");
-        spnego_debug0(
-            "ngx_http_auth_spnego_store_delegated_creds() NULL credentials");
         goto done;
     }
 
@@ -870,7 +865,7 @@ ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
     case TYPE_KRB5_CREDS:
         kerr = ngx_http_auth_spnego_store_krb5_creds(
             r, kcontext, principal, ccache,
-            (*(krb5_creds *)delegated_creds.data));
+            (krb5_creds *)delegated_creds.data);
         break;
     default:
         kerr = KRB5KRB_ERR_GENERIC;
@@ -1027,7 +1022,7 @@ ngx_http_auth_spnego_export_krb5_creds(ngx_http_request_t *r,
     }
 
     if ((kerr = ngx_http_auth_spnego_store_krb5_creds(r, kcontext, principal,
-                                                       ccache, *creds)))
+                                                       ccache, creds)))
         goto done;
 
     major_status = gss_krb5_import_cred(&minor_status, ccache, NULL, NULL,
@@ -1070,7 +1065,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
 
     code = krb5_init_context(&kcontext);
     if (code) {
-        spnego_debug0("Kerberos error: Cannot initialize kerberos context");
+        spnego_log_error("Kerberos error: Cannot initialize kerberos context");
         return NGX_ERROR;
     }
 
@@ -1476,7 +1471,6 @@ static krb5_error_code ngx_http_auth_spnego_verify_server_credentials(
 
     if (ngx_strcmp(principal_name, princ_name) != 0) {
         spnego_log_error("Kerberos error: Principal name mismatch");
-        spnego_debug0("Kerberos error: Principal name mismatch");
         kerr = KRB5KRB_ERR_GENERIC;
         goto done;
     }
