@@ -60,7 +60,7 @@ You can configure GSS authentication on a per-location and/or a global basis:
 | `auth_gss_delegate_credentials` | `off`/`on`/`export` | `off` | Delegate user credentials: `on` writes a per-request ccache file (`$krb5_cc_name`); `export` passes credentials in-memory as `$krb5_cred_exported`. |
 | `auth_gss_constrained_delegation` | `on`/`off` | `off` | Enable S4U2Proxy constrained delegation. Requires `auth_gss_delegate_credentials`. |
 | `auth_gss_service_ccache` | file path | (unset) | Path to the ccache file holding the service TGT for S4U2Proxy. Uses the process default ccache if unset. |
-| `auth_gss_service_ccache_memory` | `on`/`off` | `off` | Hold the service TGT in a per-worker MEMORY ccache instead of a file. Supersedes `auth_gss_service_ccache`. |
+| `auth_gss_service_ccache_memory` | `on`/`off` | `on` | Hold the service TGT in a per-worker MEMORY ccache instead of a file. Supersedes `auth_gss_service_ccache`. |
 | `auth_gss_channel_bindings` | `off`/`server-end-point`/`exporter` | `off` | Bind the Kerberos exchange to the TLS session. `server-end-point` (RFC 5929) is the only production-ready choice. |
 | `auth_gss_zone_name` | string | `shm_zone` | Name of the nginx shared-memory zone used to serialise service-TGT refresh across workers (FILE ccache mode only). |
 
@@ -124,11 +124,13 @@ Constrained delegation (S4U2Proxy) can be enabled with the
 `auth_gss_constrained_delegation` directive alongside `auth_gss_delegate_credentials`.
 `auth_gss_service_ccache` specifies the ccache file used to hold the server's own
 TGT for S4U2Proxy; if omitted, the process default ccache is used.
-`auth_gss_service_ccache_memory on` replaces the file-based service ccache with
-an in-memory ccache; see the Service Ccache section below.
+By default the service TGT is held in a per-worker MEMORY ccache
+(`auth_gss_service_ccache_memory on`); set it to `off` to use a file instead.
+See the Service Ccache section below.
 
 **File-based mode** (`on`):
 
+    auth_gss_service_ccache_memory off;
     auth_gss_service_ccache /tmp/krb5cc_nginx;
     auth_gss_delegate_credentials on;
     auth_gss_constrained_delegation on;
@@ -146,9 +148,8 @@ The delegated credentials file is destroyed once the request completes.
 No per-request file is created.  The credential blob is passed directly to the
 FastCGI backend as a base64-encoded parameter.
 
-**Fully file-free mode** (export + memory service ccache):
+**Fully file-free mode** (export + memory service ccache, the default):
 
-    auth_gss_service_ccache_memory on;
     auth_gss_delegate_credentials export;
     auth_gss_constrained_delegation on;
     fastcgi_param KRB5_CRED_EXPORTED $krb5_cred_exported;
@@ -162,7 +163,7 @@ scheme and has only been tested with MIT Kerberos (use at your own risk with Hei
 Service Ccache (`auth_gss_service_ccache_memory`)
 -------------------------------------------------
 
-When `auth_gss_service_ccache_memory on` is set, the HTTP service principal's
+By default (`auth_gss_service_ccache_memory on`), the HTTP service principal's
 TGT is held in a per-worker in-memory ccache rather than a file.  The
 `auth_gss_service_ccache` file path directive is then ignored.
 

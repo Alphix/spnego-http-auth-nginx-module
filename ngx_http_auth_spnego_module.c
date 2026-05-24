@@ -409,7 +409,7 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_conf_merge_str_value(conf->shm_zone_name, prev->shm_zone_name,
                              SHM_ZONE_NAME);
     ngx_conf_merge_off_value(conf->service_ccache_memory,
-                             prev->service_ccache_memory, 0);
+                             prev->service_ccache_memory, 1);
 
     if (conf->protect != 0 && !conf->service_ccache_memory) {
         if (ngx_http_auth_spnego_create_shm_zone(cf, &conf->shm_zone_name) !=
