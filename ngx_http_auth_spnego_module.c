@@ -118,7 +118,7 @@ static const char *get_gss_error(ngx_pool_t *p, OM_uint32 error_status, char *pr
         gss_release_buffer(&min_stat, &status_string);
     } while (!GSS_ERROR(maj_stat) && msg_ctx != 0);
 
-    str.len = len + 1; /* "include" '\0' */
+    str.len = len + 1; /* includes '\0' */
     str.data = (u_char *)buf;
     return (char *)(ngx_pstrdup(p, &str));
 }
@@ -132,12 +132,12 @@ typedef struct {
     creds_type type;
 } creds_info;
 
-/* per request/connection */
+/* per request */
 typedef struct {
     ngx_str_t token;         /* decoded Negotiate token */
     ngx_int_t head;          /* non-zero flag if headers set */
     ngx_int_t ret;           /* current return code */
-    ngx_str_t token_out_b64; /* base64 encoded output tokent */
+    ngx_str_t token_out_b64; /* base64 encoded output token */
 } ngx_http_auth_spnego_ctx_t;
 
 typedef struct {
@@ -629,7 +629,7 @@ ngx_http_auth_spnego_headers(ngx_http_request_t *r,
             value.len = sizeof("Negotiate") - 1;
             value.data = (u_char *)"Negotiate";
         } else {
-            value.len = sizeof("Negotiate") + token->len; /* space accounts for \0 */
+            value.len = sizeof("Negotiate") + token->len; /* sizeof includes NUL, repurposed as the space before the token */
             value.data = ngx_pcalloc(r->pool, value.len);
             if (NULL == value.data) {
                 return NGX_ERROR;
@@ -738,7 +738,7 @@ ngx_int_t ngx_http_auth_spnego_token(ngx_http_request_t *r,
 
     ctx->token.len = decoded.len;
     ctx->token.data = decoded.data;
-    spnego_debug2("Token decoded: %*s", token.len, token.data);
+    spnego_debug2("Token (base64): %*s", token.len, token.data);
 
     return NGX_OK;
 }
@@ -1265,7 +1265,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
          * The nginx module replaces the Authorization header with a bogus
          * value (ngx_http_auth_spnego_set_bogus_authorization), so
          * PHP_AUTH_PW is never the real password — the ccache is the only
-         * usable credential path for Basic-auth → IMAP delegation.
+         * usable credential path for Basic-auth → backend delegation.
          */
         creds_info delegated_creds = {&creds, TYPE_KRB5_CREDS};
         if (ngx_http_auth_spnego_store_delegated_creds(r, name,
@@ -1282,7 +1282,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     }
 
     krb5_free_cred_contents(kcontext, &creds);
-    /* Try to add the system realm to $remote_user if needed. */
+    /* Append Kerberos realm to $remote_user if not already present. */
     if (alcf->fqun &&
         !ngx_http_auth_spnego_realm_from_str(r->headers_in.user, NULL)) {
         const char *realm_at = strrchr(name, '@');
@@ -1347,9 +1347,10 @@ ngx_http_auth_spnego_strip_realm(ngx_http_request_t *r,
 
 /*
  * Because 'remote_user' is assumed to be provided by basic authorization
- * (see ngx_http_variable_remote_user) we are forced to create bogus
- * non-Negotiate authorization header. This may possibly clobber Negotiate
- * token too soon.
+ * (see ngx_http_variable_remote_user) we are forced to create a bogus
+ * non-Negotiate authorization header.  This is called only after the
+ * Negotiate token has been fully consumed, so it does not interfere with
+ * SPNEGO processing.
  */
 ngx_int_t ngx_http_auth_spnego_set_bogus_authorization(ngx_http_request_t *r) {
     const char *bogus_passwd = "bogus_auth_gss_passwd";
@@ -1898,7 +1899,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         ctx->token_out_b64.len = 0;
     }
 
-    /* getting user name at the other end of the request */
+    /* get the authenticated client principal name */
     major_status =
         gss_display_name(&minor_status, client_name, &output_token, NULL);
     if (GSS_ERROR(major_status)) {
@@ -1942,7 +1943,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         r->headers_in.user.len = output_token.length;
         ngx_http_auth_spnego_strip_realm(r, alcf);
 
-        /* this for the sake of ngx_http_variable_remote_user */
+        /* needed for ngx_http_variable_remote_user */
         if (ngx_http_auth_spnego_set_bogus_authorization(r) != NGX_OK) {
             spnego_log_error("Failed to set remote_user");
         }
