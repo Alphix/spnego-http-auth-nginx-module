@@ -143,28 +143,28 @@ typedef struct {
 } ngx_http_auth_spnego_ctx_t;
 
 typedef struct {
-    ngx_flag_t protect;
-    ngx_str_t realm;
-    ngx_str_t keytab;
-    char *keytab_prefix_path;  /* "FILE:"-prefixed path, built at config time */
-    char *keytab_path;         /* plain path: keytab_prefix_path + 5 */
-    ngx_str_t service_ccache;
+    ngx_flag_t protect;               /* auth_gss on/off */
+    ngx_str_t realm;                  /* WWW-Authenticate realm string */
+    ngx_str_t keytab;                 /* keytab path (config value) */
+    char *keytab_prefix_path;         /* "FILE:"-prefixed path, built at config time */
+    char *keytab_path;                /* plain path: keytab_prefix_path + 5 */
+    ngx_str_t service_ccache;         /* FILE ccache path for service TGT */
     char *service_ccache_prefix_path; /* "FILE:"-prefixed, built at config time;
                                          NULL when service_ccache is not set */
-    ngx_str_t srvcname;
-    ngx_str_t shm_zone_name;
-    ngx_flag_t fqun;
-    ngx_flag_t force_realm;
-    ngx_flag_t allow_basic;
-    ngx_array_t *auth_princs;
+    ngx_str_t srvcname;               /* service principal name override */
+    ngx_str_t shm_zone_name;          /* shared memory zone for cross-worker mutex */
+    ngx_flag_t fqun;                  /* include @realm in $remote_user */
+    ngx_flag_t force_realm;           /* strip/replace principal's realm */
+    ngx_flag_t allow_basic;           /* allow Basic auth fallback */
+    ngx_array_t *auth_princs;         /* allowlisted principal names */
 #if (NGX_PCRE)
-    ngx_array_t *auth_princs_regex;
+    ngx_array_t *auth_princs_regex;   /* allowlisted principal name regexes */
 #endif
-    ngx_flag_t map_to_local;
+    ngx_flag_t map_to_local;          /* map principal to local name via gss_localname() */
     ngx_uint_t delegate_credentials;  /* NGX_HTTP_AUTH_SPNEGO_DELEGATE_* */
-    ngx_flag_t constrained_delegation;
-    ngx_uint_t channel_bindings;       /* NGX_HTTP_AUTH_SPNEGO_CB_* */
-    ngx_flag_t service_ccache_memory;
+    ngx_flag_t constrained_delegation; /* use S4U2Proxy constrained delegation */
+    ngx_uint_t channel_bindings;      /* NGX_HTTP_AUTH_SPNEGO_CB_* */
+    ngx_flag_t service_ccache_memory; /* use per-worker MEMORY ccache instead of file */
 } ngx_http_auth_spnego_loc_conf_t;
 
 static void ngx_http_auth_spnego_strip_realm(ngx_http_request_t *,
