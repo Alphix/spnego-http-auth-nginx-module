@@ -548,7 +548,6 @@ static ngx_int_t ngx_http_auth_spnego_set_variable(ngx_http_request_t *r,
     }
 
     ngx_uint_t key = ngx_hash_strlow(lowercase, name->data, name->len);
-    ngx_pfree(r->pool, lowercase);
 
     ngx_http_variable_value_t *v = ngx_http_get_variable(r, name, key);
 
@@ -988,8 +987,6 @@ ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
     cln->data = ccname;
     ccname_owned_by_cleanup = true;
 done:
-    if (ccname && !ccname_owned_by_cleanup)
-        ngx_pfree(r->pool, ccname);
     if (principal)
         krb5_free_principal(kcontext, principal);
     if (ccache) {
@@ -1282,7 +1279,6 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
                     spnego_log_error("Not enough memory");
                     spnego_error(NGX_ERROR);
                 }
-                ngx_pfree(r->pool, r->headers_in.user.data);
                 r->headers_in.user.data = new_user.data;
                 r->headers_in.user.len = new_user.len;
             }
@@ -1380,7 +1376,6 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
             }
             ngx_snprintf(new_user.data, new_user.len, "%V@%s",
                          &r->headers_in.user, realm);
-            ngx_pfree(r->pool, r->headers_in.user.data);
             r->headers_in.user.data = new_user.data;
             r->headers_in.user.len = new_user.len;
         }
@@ -1401,10 +1396,6 @@ end:
         krb5_free_principal(kcontext, client);
     if (server)
         krb5_free_principal(kcontext, server);
-    if (service.data)
-        ngx_pfree(r->pool, service.data);
-    if (user.data)
-        ngx_pfree(r->pool, user.data);
     if (options)
         krb5_get_init_creds_opt_free(kcontext, options);
 
@@ -1583,8 +1574,6 @@ done:
         krb5_free_unparsed_name(kcontext, princ_name);
     if (principal)
         krb5_free_principal(kcontext, principal);
-    if (tgs_principal_name)
-        ngx_pfree(r->pool, tgs_principal_name);
     if (match_creds.server)
         krb5_free_principal(kcontext, match_creds.server);
     if (creds.client)
@@ -1768,8 +1757,6 @@ done:
         spnego_debug0("Failed to obtain server credentials");
     }
 
-    if (tgs_principal_name)
-        ngx_pfree(r->pool, tgs_principal_name);
     if (principal_name)
         krb5_free_unparsed_name(kcontext, principal_name);
     if (principal)
@@ -2109,8 +2096,6 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     goto end;
 
 end:
-    if (service.value)
-        ngx_pfree(r->pool, service.value);
 
     if (output_token.length)
         gss_release_buffer(&minor_status, &output_token);
