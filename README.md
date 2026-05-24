@@ -45,6 +45,25 @@ Configuration reference
 
 You can configure GSS authentication on a per-location and/or a global basis:
 
+| Directive | Valid values | Default | Description |
+|-----------|-------------|---------|-------------|
+| `auth_gss` | `on`/`off` | `off` | Enable or disable SPNEGO authentication for a location. |
+| `auth_gss_keytab` | file path | `/etc/krb5.keytab` | Absolute path to the keytab file containing the HTTP service credentials. |
+| `auth_gss_service_name` | string | (hostname-based) | Service principal name (e.g. `HTTP/webserver01.example.com`). Required when accessed via a CNAME. |
+| `auth_gss_allow_basic_fallback` | `on`/`off` | `off` | Accept HTTP Basic credentials when the client does not attempt SPNEGO. See security warning in the text below. |
+| `auth_gss_realm` | string | (unset) | Kerberos realm. Normally not needed — the realm is negotiated automatically. |
+| `auth_gss_authorized_principal` | string | (unset) | Allowlist a specific principal (e.g. `alice@EXAMPLE.COM`). Multiple directives are supported. |
+| `auth_gss_authorized_principal_regex` | regex | (unset) | Allowlist principals matching a regex (e.g. `^.*/admin@EXAMPLE\.COM$`). Multiple directives are supported. |
+| `auth_gss_format_full` | `on`/`off` | `off` | Include `@realm` in `$remote_user` even when the realm matches `auth_gss_realm`. |
+| `auth_gss_force_realm` | `on`/`off` | `off` | Force authentication against the configured realm, rewriting any client-supplied realm. |
+| `auth_gss_map_to_local` | `on`/`off` | `off` | Map the Kerberos principal to a local username via `gss_localname()`. |
+| `auth_gss_delegate_credentials` | `off`/`on`/`export` | `off` | Delegate user credentials: `on` writes a per-request ccache file (`$krb5_cc_name`); `export` passes credentials in-memory as `$krb5_cred_exported`. |
+| `auth_gss_constrained_delegation` | `on`/`off` | `off` | Enable S4U2Proxy constrained delegation. Requires `auth_gss_delegate_credentials`. |
+| `auth_gss_service_ccache` | file path | (unset) | Path to the ccache file holding the service TGT for S4U2Proxy. Uses the process default ccache if unset. |
+| `auth_gss_service_ccache_memory` | `on`/`off` | `off` | Hold the service TGT in a per-worker MEMORY ccache instead of a file. Supersedes `auth_gss_service_ccache`. |
+| `auth_gss_channel_bindings` | `off`/`server-end-point`/`exporter` | `off` | Bind the Kerberos exchange to the TLS session. `server-end-point` (RFC 5929) is the only production-ready choice. |
+| `auth_gss_zone_name` | string | `shm_zone` | Name of the nginx shared-memory zone used to serialise service-TGT refresh across workers (FILE ccache mode only). |
+
 The following options are mandatory:
 * `auth_gss`: on/off, for ease of unsecuring while leaving other options in
   the config file.
