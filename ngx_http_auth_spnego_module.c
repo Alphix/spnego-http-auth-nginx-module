@@ -1079,6 +1079,12 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     krb5_principal server = NULL;
     krb5_creds creds;
     krb5_get_init_creds_opt *options = NULL;
+    krb5_keytab keytab = NULL;
+    krb5_ccache armor_ccache = NULL;
+#ifndef NGX_HAVE_HEIMDAL_KRB5
+    krb5_creds armor_creds;
+    krb5_get_init_creds_opt *armor_opts = NULL;
+#endif
     char *name = NULL;
     u_char *realm = NULL;
     size_t realm_len = 0;
@@ -1241,6 +1247,9 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     }
 
     memset(&creds, 0, sizeof(creds));
+#ifndef NGX_HAVE_HEIMDAL_KRB5
+    memset(&armor_creds, 0, sizeof(armor_creds));
+#endif
 
     code = krb5_unparse_name(kcontext, client, &name);
     if (code) {
@@ -1257,6 +1266,44 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     }
 
     krb5_get_init_creds_opt_set_tkt_life(options, BASIC_AUTH_TKT_LIFE);
+
+    if ((code = krb5_kt_resolve(kcontext, alcf->keytab_prefix_path, &keytab))) {
+        spnego_log_error("Kerberos error: Cannot resolve keytab %s",
+                         alcf->keytab_prefix_path);
+        spnego_log_krb5_error(kcontext, code);
+        spnego_error(NGX_ERROR);
+    }
+
+#ifndef NGX_HAVE_HEIMDAL_KRB5
+    code = krb5_cc_new_unique(kcontext, "MEMORY", NULL, &armor_ccache);
+    if (code) {
+        spnego_log_error("Kerberos error: Cannot create FAST armor ccache");
+        spnego_log_krb5_error(kcontext, code);
+        spnego_error(NGX_ERROR);
+    }
+
+    code = krb5_get_init_creds_opt_alloc(kcontext, &armor_opts);
+    if (code) {
+        spnego_log_error("Kerberos error: Cannot allocate armor options");
+        spnego_log_krb5_error(kcontext, code);
+        spnego_error(NGX_ERROR);
+    }
+
+    krb5_get_init_creds_opt_set_out_ccache(kcontext, armor_opts, armor_ccache);
+    code = krb5_get_init_creds_keytab(kcontext, &armor_creds, server,
+                                      keytab, 0, NULL, armor_opts);
+    krb5_get_init_creds_opt_free(kcontext, armor_opts);
+    armor_opts = NULL;
+    krb5_free_cred_contents(kcontext, &armor_creds);
+    if (code) {
+        spnego_log_error("Kerberos error: Cannot obtain FAST armor TGT");
+        spnego_log_krb5_error(kcontext, code);
+        spnego_error(NGX_ERROR);
+    }
+
+    krb5_get_init_creds_opt_set_fast_ccache(kcontext, options, armor_ccache);
+    krb5_get_init_creds_opt_set_fast_flags(kcontext, options, KRB5_FAST_REQUIRED);
+#endif
 
     char *passwd = ngx_pnalloc(r->pool, r->headers_in.passwd.len + 1);
     if (passwd == NULL) {
@@ -1275,16 +1322,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         spnego_error(NGX_DECLINED);
     }
 
-    krb5_keytab keytab = NULL;
     krb5_verify_init_creds_opt vic_opts;
-
-    if ((code = krb5_kt_resolve(kcontext, alcf->keytab_prefix_path, &keytab))) {
-        spnego_log_error("Kerberos error: Cannot resolve keytab %s",
-                         alcf->keytab_prefix_path);
-        spnego_log_krb5_error(kcontext, code);
-        krb5_free_cred_contents(kcontext, &creds);
-        spnego_error(NGX_ERROR);
-    }
 
     krb5_verify_init_creds_opt_init(&vic_opts);
 #ifdef NGX_HAVE_HEIMDAL_KRB5
@@ -1296,6 +1334,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     code = krb5_verify_init_creds(kcontext, &creds, server, keytab,
                                   NULL, &vic_opts);
     krb5_kt_close(kcontext, keytab);
+    keytab = NULL;
 
     if (code) {
         spnego_log_error("Kerberos error: Credential verification failed "
@@ -1358,6 +1397,12 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
 end:
     if (name)
         free(name);
+#ifndef NGX_HAVE_HEIMDAL_KRB5
+    if (armor_ccache)
+        krb5_cc_destroy(kcontext, armor_ccache);
+#endif
+    if (keytab)
+        krb5_kt_close(kcontext, keytab);
     if (client)
         krb5_free_principal(kcontext, client);
     if (server)
