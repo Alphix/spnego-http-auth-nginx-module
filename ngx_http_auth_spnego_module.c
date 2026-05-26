@@ -136,6 +136,11 @@ typedef struct {
     ngx_str_t token_out_b64; /* base64 encoded output token */
 } ngx_http_auth_spnego_ctx_t;
 
+/* per-connection state for multi-trip GSSAPI exchanges */
+typedef struct {
+    gss_ctx_id_t gss_ctx;
+} ngx_http_auth_spnego_conn_ctx_t;
+
 typedef struct {
     ngx_flag_t protect;
     ngx_str_t realm;
@@ -1732,6 +1737,47 @@ ngx_http_auth_spnego_build_channel_binding(ngx_http_request_t *r,
 }
 #endif /* NGX_HTTP_SSL */
 
+
+static void
+ngx_http_auth_spnego_conn_cleanup(void *data)
+{
+    ngx_http_auth_spnego_conn_ctx_t *cc = data;
+    OM_uint32                        minor;
+    if (cc->gss_ctx != GSS_C_NO_CONTEXT)
+        gss_delete_sec_context(&minor, &cc->gss_ctx, GSS_C_NO_BUFFER);
+}
+
+static ngx_http_auth_spnego_conn_ctx_t *
+ngx_http_auth_spnego_get_conn_ctx(ngx_connection_t *c)
+{
+    ngx_pool_cleanup_t *cln;
+    for (cln = c->pool->cleanup; cln; cln = cln->next) {
+        if (cln->handler == ngx_http_auth_spnego_conn_cleanup)
+            return cln->data;
+    }
+    return NULL;
+}
+
+static ngx_http_auth_spnego_conn_ctx_t *
+ngx_http_auth_spnego_ensure_conn_ctx(ngx_connection_t *c)
+{
+    ngx_pool_cleanup_t              *cln;
+    ngx_http_auth_spnego_conn_ctx_t *cc;
+
+    cc = ngx_http_auth_spnego_get_conn_ctx(c);
+    if (cc)
+        return cc;
+
+    cln = ngx_pool_cleanup_add(c->pool, sizeof(*cc));
+    if (cln == NULL)
+        return NULL;
+
+    cc           = cln->data;
+    cc->gss_ctx  = GSS_C_NO_CONTEXT;
+    cln->handler = ngx_http_auth_spnego_conn_cleanup;
+    return cc;
+}
+
 ngx_int_t
 ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
                                    ngx_http_auth_spnego_ctx_t *ctx,
@@ -1750,6 +1796,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     gss_name_t client_name = GSS_C_NO_NAME;
     gss_buffer_desc output_token = GSS_C_EMPTY_BUFFER;
     gss_channel_bindings_t cb;
+    ngx_http_auth_spnego_conn_ctx_t *saved_cc = NULL;
 
     if (NULL == ctx || ctx->token.len == 0)
         return ret;
@@ -1819,6 +1866,13 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     input_token.length = ctx->token.len;
     input_token.value = (void *)ctx->token.data;
 
+    /* Restore a partially-established GSS context from a previous round trip. */
+    saved_cc = ngx_http_auth_spnego_get_conn_ctx(r->connection);
+    if (saved_cc && saved_cc->gss_ctx != GSS_C_NO_CONTEXT) {
+        gss_context = saved_cc->gss_ctx;
+        saved_cc->gss_ctx = GSS_C_NO_CONTEXT;
+    }
+
     cb = GSS_C_NO_CHANNEL_BINDINGS;
     if (alcf->channel_binding != NGX_HTTP_AUTH_SPNEGO_CB_OFF) {
 #if (NGX_HTTP_SSL)
@@ -1847,8 +1901,37 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     }
 
     if (major_status & GSS_S_CONTINUE_NEEDED) {
-        spnego_debug0("only one authentication iteration allowed");
-        spnego_error(NGX_DECLINED);
+        spnego_debug0("gss_accept_sec_context() needs another round trip");
+
+        if (output_token.length == 0) {
+            spnego_debug0("CONTINUE_NEEDED but no output token — cannot continue");
+            spnego_error(NGX_DECLINED);
+        }
+
+        saved_cc = ngx_http_auth_spnego_ensure_conn_ctx(r->connection);
+        if (saved_cc == NULL) {
+            spnego_log_error("failed to allocate per-connection GSS context");
+            spnego_error(NGX_ERROR);
+        }
+
+        /* Transfer ownership to the per-connection store so the end: block
+         * does not delete the context — it will be resumed on the next
+         * request on this keep-alive connection. */
+        saved_cc->gss_ctx = gss_context;
+        gss_context = GSS_C_NO_CONTEXT;
+
+        ngx_str_t b64 = ngx_null_string;
+        b64.len  = ngx_base64_encoded_length(output_token.length);
+        b64.data = ngx_palloc(r->pool, b64.len + 1);
+        if (b64.data == NULL) {
+            spnego_error(NGX_ERROR);
+        }
+        ngx_str_t raw = { output_token.length, (u_char *)output_token.value };
+        ngx_encode_base64(&b64, &raw);
+        b64.data[b64.len] = '\0';
+        ctx->token_out_b64 = b64;
+
+        spnego_error(NGX_AGAIN);
     }
 
     if (alcf->channel_binding != NGX_HTTP_AUTH_SPNEGO_CB_OFF
@@ -2028,9 +2111,16 @@ static ngx_int_t ngx_http_auth_spnego_handler(ngx_http_request_t *r) {
             spnego_debug0("GSSAPI failed");
             return (ctx->ret = NGX_HTTP_INTERNAL_SERVER_ERROR);
         }
-        /* There are chances that client knows about Negotiate
-         * but doesn't support GSSAPI. We could attempt to fall
-         * back to basic here... */
+        if (NGX_AGAIN == ret) {
+            spnego_debug0("GSSAPI needs another round trip");
+            if (NGX_ERROR == ngx_http_auth_spnego_headers(r, ctx,
+                                                          &ctx->token_out_b64,
+                                                          alcf)) {
+                spnego_debug0("Error setting headers");
+                return (ctx->ret = NGX_HTTP_INTERNAL_SERVER_ERROR);
+            }
+            return (ctx->ret = NGX_HTTP_UNAUTHORIZED);
+        }
         if (NGX_DECLINED == ret) {
             spnego_debug0("GSSAPI failed");
             if (!alcf->allow_basic) {
