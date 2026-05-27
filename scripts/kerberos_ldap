@@ -35,6 +35,8 @@ LDAP_KADMIN_DN="uid=kadmin,${LDAP_KRB_DN}"
 LDAP_KADMIN_PW="kadmintest"
 LDAP_ADMIN_DN="cn=admin,${LDAP_BASE_DN}"
 LDAP_ADMIN_PW="test"
+LDAP_HTTP_DN="uid=http,${LDAP_SERVICES_DN}"
+LDAP_HTTP_PW="httptest"
 KRB_BOB_PW="bob@BOB@123"
 KERBEROS_REALM="$(echo "${DOMAIN}" | tr "[:lower:]" "[:upper:]")"
 export LC_ALL=C
@@ -47,6 +49,8 @@ die()
 	exit 1
 }
 
+# Resolve the repo root (parent of scripts/) before any cd changes the cwd.
+WORKSPACE_DIR="$(cd "$(dirname -- "$0")/.." && pwd)"
 
 # Resolve the repo root (parent of scripts/) before any cd changes the cwd.
 WORKSPACE_DIR="$(cd "$(dirname -- "$0")/.." && pwd)"
@@ -88,6 +92,8 @@ LDAP kadmin DN			: ${LDAP_KADMIN_DN}
 LDAP kadmin PW			: ${LDAP_KADMIN_PW}
 LDAP admin DN			: ${LDAP_ADMIN_DN}
 LDAP admin PW			: ${LDAP_ADMIN_PW}
+LDAP HTTP DN			: ${LDAP_HTTP_DN}
+LDAP HTTP PW			: ${LDAP_HTTP_PW}
 KRB bob PW			: ${KRB_BOB_PW}
 ==============================================================================
 EOF
@@ -151,6 +157,24 @@ zcat /usr/share/doc/krb5-kdc-ldap/kerberos.openldap.ldif.gz | \
 echo "OK"
 
 
+printf "Loading memberOf overlay module ... "
+if ! ldapmodify -Q -Y EXTERNAL -H ldapi:/// > /dev/null 2>&1 <<EOF
+dn: cn=module{0},cn=config
+changetype: modify
+add: olcModuleLoad
+olcModuleLoad: memberof
+EOF
+then
+	ldapadd -Q -Y EXTERNAL -H ldapi:/// > /dev/null <<EOF || die
+dn: cn=module,cn=config
+objectClass: olcModuleList
+cn: module
+olcModuleLoad: memberof
+EOF
+fi
+echo "OK"
+
+
 printf "Creating basic Kerberos LDAP structure ... "
 if ! ldapadd -x -D "${LDAP_ADMIN_DN}" -w "${LDAP_ADMIN_PW}" > /dev/null <<EOF
 dn: ${LDAP_SERVICES_DN}
@@ -208,6 +232,103 @@ add: olcAccess
 olcAccess: {1}to dn.subtree="${LDAP_KRB_CONTAINER_DN}"
   by dn.exact="${LDAP_KDC_DN}" read
   by dn.exact="${LDAP_KADMIN_DN}" write
+  by * none
+EOF
+then
+	die
+fi
+echo "OK"
+
+
+printf "Creating People OU, Groups OU, user entries, and HTTP service account ... "
+if ! ldapadd -x -D "${LDAP_ADMIN_DN}" -w "${LDAP_ADMIN_PW}" > /dev/null <<EOF
+dn: ou=People,${LDAP_BASE_DN}
+objectClass: organizationalUnit
+ou: People
+
+dn: ou=Groups,${LDAP_BASE_DN}
+objectClass: organizationalUnit
+ou: Groups
+
+dn: uid=alice,ou=People,${LDAP_BASE_DN}
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice
+sn: Test
+
+dn: uid=mallory,ou=People,${LDAP_BASE_DN}
+objectClass: inetOrgPerson
+uid: mallory
+cn: Mallory
+sn: Test
+
+dn: uid=bob,ou=People,${LDAP_BASE_DN}
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob
+sn: Test
+
+dn: ${LDAP_HTTP_DN}
+uid: http
+objectClass: account
+objectClass: simpleSecurityObject
+userPassword: {CRYPT}x
+description: nginx service account for LDAP group lookups
+EOF
+then
+	die
+fi
+echo "OK"
+
+
+printf "Configuring memberOf overlay ... "
+if ! ldapadd -Q -Y EXTERNAL -H ldapi:/// > /dev/null <<EOF
+dn: olcOverlay=memberof,olcDatabase={1}mdb,cn=config
+objectClass: olcOverlayConfig
+objectClass: olcMemberOf
+olcOverlay: memberof
+olcMemberOfDangling: ignore
+olcMemberOfRefInt: TRUE
+olcMemberOfGroupOC: groupOfNames
+olcMemberOfMemberAD: member
+olcMemberOfMemberOfAD: memberOf
+EOF
+then
+	die
+fi
+echo "OK"
+
+
+printf "Creating webusers authorization group ... "
+if ! ldapadd -x -D "${LDAP_ADMIN_DN}" -w "${LDAP_ADMIN_PW}" > /dev/null <<EOF
+dn: cn=webusers,ou=Groups,${LDAP_BASE_DN}
+objectClass: groupOfNames
+cn: webusers
+member: uid=alice,ou=People,${LDAP_BASE_DN}
+EOF
+then
+	die
+fi
+echo "OK"
+
+
+printf "Setting LDAP password for HTTP service account ... "
+ldappasswd -x -D "${LDAP_ADMIN_DN}" -w "${LDAP_ADMIN_PW}" \
+	-s "${LDAP_HTTP_PW}" "${LDAP_HTTP_DN}" || die
+echo "OK"
+
+
+printf "Granting KDC, kadmin, and HTTP service account access to People OU ... "
+if ! ldapmodify -Q -Y EXTERNAL -H ldapi:/// > /dev/null <<EOF
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcAccess
+olcAccess: {2}to dn.subtree="ou=People,${LDAP_BASE_DN}"
+  by dn.exact="${LDAP_KDC_DN}" read
+  by dn.exact="${LDAP_KADMIN_DN}" write
+  by dn.exact="${LDAP_HTTP_DN}" read
+  by dn.subtree="cn=gssapi,cn=auth" read
+  by dn.subtree="cn=gss-spnego,cn=auth" read
   by * none
 EOF
 then
@@ -345,10 +466,11 @@ echo "OK"
 
 
 printf "Creating test user principals ... "
-kadmin.local -q "addprinc -randkey -policy defaultpol alice" > /dev/null || die
+rm -f krb5.alice.keytab krb5.mallory.keytab
+kadmin.local -q "addprinc -randkey -policy defaultpol -x dn=uid=alice,ou=People,${LDAP_BASE_DN} alice" > /dev/null || die
 kadmin.local -q "ktadd -k krb5.alice.keytab alice" > /dev/null || die
-kadmin.local -q "addprinc -pw ${KRB_BOB_PW} -policy defaultpol bob" > /dev/null || die
-kadmin.local -q "addprinc -randkey -policy defaultpol mallory" > /dev/null || die
+kadmin.local -q "addprinc -pw ${KRB_BOB_PW} -policy defaultpol -x dn=uid=bob,ou=People,${LDAP_BASE_DN} bob" > /dev/null || die
+kadmin.local -q "addprinc -randkey -policy defaultpol -x dn=uid=mallory,ou=People,${LDAP_BASE_DN} mallory" > /dev/null || die
 kadmin.local -q "ktadd -k krb5.mallory.keytab mallory" > /dev/null || die
 echo "OK"
 
@@ -387,6 +509,13 @@ kadmin.local -q "modprinc +ok_to_auth_as_delegate HTTP/${TEST_HOST_FQDN}" > /dev
 kadmin.local -q "ktadd -k /etc/krb5.http.keytab HTTP/${TEST_HOST_FQDN}" > /dev/null || die
 chown root:www-data /etc/krb5.http.keytab || die
 chmod 0640 /etc/krb5.http.keytab || die
+echo "OK"
+
+
+printf "Creating nginx Kerberos ccache for LDAP GSSAPI bind ... "
+rm -f /tmp/krb5cc_nginx
+kinit -kt /etc/krb5.http.keytab "HTTP/${TEST_HOST_FQDN}" -c /tmp/krb5cc_nginx || die
+chown www-data:www-data /tmp/krb5cc_nginx || die
 echo "OK"
 
 
@@ -525,6 +654,9 @@ if ! cat <<EOF > /etc/nginx/sites-available/kerberos
 map \$uri \$destination_ccache {
 	default "FILE:/tmp/destination-cache";
 }
+# lua-resty-ldap and its dependencies are installed via luarocks to /usr/local
+lua_package_path "/usr/local/share/lua/5.1/?.lua;/usr/local/share/lua/5.1/?/init.lua;;";
+lua_package_cpath "/usr/local/lib/lua/5.1/?.so;;";
 
 server {
 	listen 8080;
@@ -1442,6 +1574,20 @@ $(delegation_settings bob)
 		add_header X-Ccache "\$krb5_cc_name" always;
 	}
 
+	# Lua LDAP authorization: SPNEGO authenticates first (access_by_lua_file
+	# is postponed to run last in the access phase by default), then checks
+	# LDAP group membership for the authenticated principal.
+	location /luaauth.html {
+		auth_gss on;
+		auth_gss_realm ${KERBEROS_REALM};
+		auth_gss_keytab /etc/krb5.http.keytab;
+		auth_gss_service_name HTTP/${TEST_HOST_FQDN};
+		auth_gss_allow_basic_fallback off;
+		auth_gss_format_full on;
+		fastcgi_param HTTP_AUTHORIZATION "";
+
+		access_by_lua_file /etc/nginx/lua/ldap_authz.lua;
+	}
 }
 
 # HTTPS server for channel binding tests.
@@ -1819,6 +1965,9 @@ then
 fi
 echo "OK"
 
+printf "Writing luaauth.html static file ... "
+echo "Authorized" > /var/www/kerberos/luaauth.html && echo "OK" || die
+
 printf "Writing export_check.php ... "
 if ! cat <<'EOF' > /var/www/kerberos/export_check.php
 <?php
@@ -1921,6 +2070,17 @@ echo "OK"
 # was installed, it won't pick up the new GSSAPI capabilities until it has been
 # restarted...so let's restart all services that might use SASL/GSSAPI in our
 # tests.
+printf "Installing Lua LDAP authorization script ... "
+mkdir -p /etc/nginx/lua || die
+cp "${WORKSPACE_DIR}/contrib/ldap_authz.lua" /etc/nginx/lua/ldap_authz.lua || die
+echo "OK"
+
+
+printf "Adding KRB5CCNAME env directive to nginx.conf ... "
+sed -i '/^env KRB5CCNAME=.*/d' /etc/nginx/nginx.conf
+sed -i 's|^events {|env KRB5CCNAME=FILE:/tmp/krb5cc_nginx;\n\nevents {|' /etc/nginx/nginx.conf || die
+echo "OK"
+
 printf "Restarting nginx and PHP-FPM ... "
 systemctl restart nginx
 systemctl restart "php*-fpm.service"
@@ -2451,6 +2611,7 @@ test_path "noauth.php" 200 200
 test_path "auth.php" 401 401
 test_path "delegate.php" 401 401
 test_path "export_check.php" 401 401
+test_path "luaauth.html" 401 401
 
 
 echo ""
@@ -2599,6 +2760,7 @@ test_redirect_token "redirect/response-status/?status=401" 401 absent 'X-Test-St
 test_redirect_token "redirect/response-status/?status=403" 403 absent 'X-Test-Status: 403'
 test_path "export_check.php" 401 200 "${CURL_NEGOTIATE_DELEGATE}"
 test_export_check "alice"
+test_path "luaauth.html" 401 200
 
 
 echo ""
@@ -2616,6 +2778,7 @@ test_path "noauth.php" 200 200
 test_path "auth.php" 401 403
 test_path "delegate.php" 401 403
 test_path "export_check.php" 401 403
+test_path "luaauth.html" 401 403
 
 
 echo ""
@@ -2633,6 +2796,35 @@ test_path "noauth.php" 200 200
 test_path "auth.php" 401 403
 test_path "delegate.php" 401 403
 test_path "export_check.php" 401 403
+test_path "luaauth.html" 401 403
+
+echo ""
+printf "Adding bob to webusers group ... "
+if ! ldapmodify -x -D "${LDAP_ADMIN_DN}" -w "${LDAP_ADMIN_PW}" > /dev/null <<EOF
+dn: cn=webusers,ou=Groups,${LDAP_BASE_DN}
+changetype: modify
+add: member
+member: uid=bob,ou=People,${LDAP_BASE_DN}
+EOF
+then
+	die
+fi
+echo "OK"
+test_path "luaauth.html" 401 200
+
+echo ""
+printf "Removing bob from webusers group ... "
+if ! ldapmodify -x -D "${LDAP_ADMIN_DN}" -w "${LDAP_ADMIN_PW}" > /dev/null <<EOF
+dn: cn=webusers,ou=Groups,${LDAP_BASE_DN}
+changetype: modify
+delete: member
+member: uid=bob,ou=People,${LDAP_BASE_DN}
+EOF
+then
+	die
+fi
+echo "OK"
+test_path "luaauth.html" 401 403
 
 
 echo ""

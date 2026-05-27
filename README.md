@@ -392,6 +392,7 @@ feature:
   short `auth_gss_session_expiry` to bound the window during which this
   matters.
 
+
 Authorization
 -------------
 
@@ -415,7 +416,6 @@ it from your nginx location block:
         auth_gss_format_full on;
         access_by_lua_file /etc/nginx/lua/ldap_authz.lua;
     }
-
 
 
 Troubleshooting
@@ -502,6 +502,7 @@ Important Changes
 * New `auth_gss_deleg_ccache_dir` directive stores delegated credentials as named FILE ccaches; the ccache path is exposed via `$krb5_cc_name`.
 * Session cookie support: new `auth_gss_session_key`, `auth_gss_session_expiry`, and related directives; `$krb5_session_principal` variable for cookie-authenticated requests.
 * New `$krb5_auth_type` variable reports how a request was authenticated: `spnego`, `basic`, or `cookie`.
+* `contrib/ldap_authz.lua`: example Lua script for LDAP group authorization after SPNEGO authentication.
 
 
 Help

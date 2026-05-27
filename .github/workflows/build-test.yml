@@ -37,10 +37,21 @@ jobs:
             slapd ldap-utils                                                  \
             krb5-admin-server krb5-kdc krb5-kdc-ldap                          \
             libsasl2-modules-gssapi-mit                                       \
-            php-fpm php-ldap openssl
+            php-fpm php-ldap openssl                                          \
+            libnginx-mod-http-lua luarocks cargo
 
       - name: Check out repository code
         uses: actions/checkout@v5
+
+      - name: Clone, build and install lua-resty-ldap
+        run: |
+          # The "merged" branch of Alphix's fork adds SASL/GSSAPI bind support
+          # needed by contrib/ldap_authz.lua, which isn't in any released
+          # version yet, so build and install it from a git checkout.
+          git clone --branch merged --depth 1 https://github.com/Alphix/lua-resty-ldap.git \
+            /tmp/lua-resty-ldap
+          cd /tmp/lua-resty-ldap
+          sudo luarocks make rockspec/lua-resty-ldap-local-0.rockspec
 
       - name: Create build directory
         run: |
