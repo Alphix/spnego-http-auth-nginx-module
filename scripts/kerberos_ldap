@@ -48,6 +48,9 @@ die()
 }
 
 
+# Resolve the repo root (parent of scripts/) before any cd changes the cwd.
+WORKSPACE_DIR="$(cd "$(dirname -- "$0")/.." && pwd)"
+
 if [ -n "${AUTOPKGTEST_TMP}" ]; then
 	cd "${AUTOPKGTEST_TMP}" || exit 1
 elif [ -n "${GITHUB_WORKSPACE}" ]; then
@@ -476,6 +479,43 @@ else
 fi
 
 
+
+# Session cookies need AES-256-GCM-SIV (OpenSSL 3.2 or later). Without it the
+# module must refuse to start when a session key is configured. Probe what this
+# nginx, module and OpenSSL actually do rather than guessing from versions.
+printf "Checking whether nginx supports session cookies ... "
+SESSION_PROBE_CONF="$(mktemp)"
+cat <<EOF > "${SESSION_PROBE_CONF}" || die
+include /etc/nginx/modules-enabled/*.conf;
+error_log stderr;
+pid ${SESSION_PROBE_CONF}.pid;
+events {}
+http {
+	server {
+		listen 127.0.0.1:8099;
+		location / {
+			auth_gss on;
+			auth_gss_realm ${KERBEROS_REALM};
+			auth_gss_keytab /etc/krb5.http.keytab;
+			auth_gss_service_name HTTP/${TEST_HOST_FQDN};
+			auth_gss_session_key "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+		}
+	}
+}
+EOF
+if SESSION_PROBE="$(nginx -t -c "${SESSION_PROBE_CONF}" 2>&1)"; then
+	SESSION_COOKIES=yes
+	echo "OK (supported)"
+elif printf '%s\n' "${SESSION_PROBE}" \
+	| grep -qF "session cookies require the AES-256-GCM-SIV cipher"; then
+	SESSION_COOKIES=no
+	echo "OK (unsupported, nginx refuses to start with a session key)"
+else
+	printf '%s\n' "${SESSION_PROBE}"
+	rm -f "${SESSION_PROBE_CONF}"
+	die
+fi
+rm -f "${SESSION_PROBE_CONF}"
 
 printf "Creating nginx test site ... "
 if ! cat <<EOF > /etc/nginx/sites-available/kerberos
@@ -1514,14 +1554,79 @@ server {
 	}
 }
 
+
+# BEGIN session cookie server
+# HTTP server for session cookie tests (separate port 8081 so cookie tests
+# don't interfere with the main test flow).
+server {
+	listen 8081;
+	listen [::]:8081;
+
+	root /var/www/kerberos;
+	server_name ${TEST_HOST_FQDN};
+
+	# Session cookie endpoint: first request uses SPNEGO, subsequent requests
+	# are authenticated from the encrypted session cookie.
+	location /session.php {
+		include snippets/fastcgi-php.conf;
+		fastcgi_pass unix:/run/php/php-fpm.sock;
+		auth_gss on;
+		auth_gss_realm ${KERBEROS_REALM};
+		auth_gss_keytab /etc/krb5.http.keytab;
+		auth_gss_service_name HTTP/${TEST_HOST_FQDN};
+		auth_gss_allow_basic_fallback off;
+		auth_gss_authorized_principal alice@${KERBEROS_REALM};
+		auth_gss_format_full on;
+		fastcgi_param HTTP_AUTHORIZATION "";
+		fastcgi_param REMOTE_USER \$remote_user;
+		fastcgi_param SESSION_PRINCIPAL \$krb5_session_principal;
+		# 64-char hex AES-256 key shared across the cluster
+		auth_gss_session_key "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+		auth_gss_session_cookie_name gss_session;
+		auth_gss_session_expiry 3600;
+	}
+
+	# Cookie-then-redirect: access check at /cookie_redir.html uses session
+	# cookie; try_files redirects internally to @cookie_redir_target which
+	# has no cookie config and allow_basic_fallback on.  Tests that
+	# save_login() is called after cookie auth so the ctx survives the
+	# internal redirect (without it the bogus Authorization header would be
+	# parsed as Basic auth and rejected). The target serves a static file
+	# rather than using "return", which would answer before the access phase.
+	location = /cookie_redir.html {
+		auth_gss on;
+		auth_gss_realm ${KERBEROS_REALM};
+		auth_gss_keytab /etc/krb5.http.keytab;
+		auth_gss_service_name HTTP/${TEST_HOST_FQDN};
+		auth_gss_allow_basic_fallback off;
+		auth_gss_session_key "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+		auth_gss_session_cookie_name gss_session;
+		auth_gss_session_expiry 3600;
+		try_files /NONEXISTENT @cookie_redir_target;
+	}
+	location @cookie_redir_target {
+		auth_gss on;
+		auth_gss_realm ${KERBEROS_REALM};
+		auth_gss_keytab /etc/krb5.http.keytab;
+		auth_gss_service_name HTTP/${TEST_HOST_FQDN};
+		auth_gss_allow_basic_fallback on;
+		default_type text/plain;
+		rewrite ^ /cookie_redirect_ok break;
+	}
+}
+# END session cookie server
 EOF
 then
 	die
 fi
+if [ "${SESSION_COOKIES}" != yes ]; then
+	sed -i '/^# BEGIN session cookie server$/,/^# END session cookie server$/d' \
+		/etc/nginx/sites-available/kerberos || die
+fi
 ln -s /etc/nginx/sites-available/kerberos /etc/nginx/sites-enabled/ || die
 mkdir -p /var/www/kerberos || die
-mkdir -p /var/lib/krb5_deleg_caches || die
-chown www-data:www-data /var/lib/krb5_deleg_caches || die
+cp "${WORKSPACE_DIR}/contrib/nginx-tmpfiles.conf" /etc/tmpfiles.d/nginx-ccaches.conf || die
+systemd-tmpfiles --create /etc/tmpfiles.d/nginx-ccaches.conf || die
 echo "OK"
 
 
@@ -1699,6 +1804,8 @@ echo "OK"
 
 printf "Writing satisfyany static file ... "
 echo "OK" > /var/www/kerberos/satisfyany && echo "OK" || die
+printf "Writing cookie_redirect_ok static file ... "
+printf 'cookie_redirect_ok' > /var/www/kerberos/cookie_redirect_ok && echo "OK" || die
 printf "Writing cache_denied.php ... "
 if ! cat <<'EOF' > /var/www/kerberos/cache_denied.php
 <?php
@@ -1791,6 +1898,22 @@ cp /var/www/kerberos/delegate.php /var/www/kerberos/public_sub_delegate.php || d
 sed 's/^\techo(\$who);$/\tif ($who !== "dn:uid=alice,cn=gss-spnego,cn=auth") {\n\t\thttp_response_code(500);\n\t\texit();\n\t}\n\techo($who);/' \
 	/var/www/kerberos/delegate.php > /var/www/kerberos/sub_delegate.php || die
 grep -q 'dn:uid=alice,cn=gss-spnego,cn=auth' /var/www/kerberos/sub_delegate.php || die
+echo "OK"
+
+printf "Writing session.php ... "
+if ! cat <<'EOF' > /var/www/kerberos/session.php
+<?php
+	if (!isset($_SERVER["REMOTE_USER"]) || $_SERVER["REMOTE_USER"] == "") {
+		http_response_code(500);
+		echo("REMOTE_USER not set");
+		exit();
+	}
+	echo("Authenticated as " . $_SERVER["REMOTE_USER"]);
+?>
+EOF
+then
+	die
+fi
 echo "OK"
 
 
@@ -2228,6 +2351,97 @@ systemctl restart nginx || die
 echo "OK"
 
 
+# Test session cookie authentication:
+# 1. First request: SPNEGO auth; expect 200 and a Set-Cookie header.
+# 2. Destroy Kerberos tickets so subsequent requests have no client creds.
+# 3. Cookie-only request (no Negotiate header); expect 200.
+# 4. Verify body matches "Authenticated as <user>".
+# 5. Verify a tampered cookie is rejected.
+# Usage: test_session_cookie <suburl> <port> <expected_user> [cookie_name]
+test_session_cookie()
+{
+	SUBURL="$1"
+	PORT="${2:-8081}"
+	EXPECTED_USER="$3"
+	COOKIE_NAME="${4:-gss_session}"
+	EXPECTED_BODY="Authenticated as ${EXPECTED_USER}"
+	TMPHEADERS="$(mktemp)"
+
+	printf "curl port %s/%s, session SPNEGO (expect 200+Set-Cookie)=" \
+		"${PORT}" "${SUBURL}"
+	rm -f "${CURL_OUTPUT}"
+	CODE="$(${CURL_NEGOTIATE} -D "${TMPHEADERS}" -o "${CURL_OUTPUT}" \
+		-w "%{http_code}" \
+		"http://${TEST_HOST_FQDN}:${PORT}/${SUBURL}")" || true
+	printf "%s ... " "${CODE}"
+	if [ "${CODE}" != "200" ]; then
+		EX=1
+		echo "FAILED"
+		if [ -e "${CURL_OUTPUT}" ]; then cat "${CURL_OUTPUT}"; echo ""; fi
+		rm -f "${TMPHEADERS}"
+		return
+	fi
+	echo "OK"
+
+	COOKIE_VAL="$(grep -i "^Set-Cookie: ${COOKIE_NAME}=" "${TMPHEADERS}" \
+		| head -1 | sed "s/^[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]: ${COOKIE_NAME}=//i" \
+		| sed 's/;.*//' | tr -d '\r')"
+	rm -f "${TMPHEADERS}"
+
+	printf "Set-Cookie: %s=<value> present ... " "${COOKIE_NAME}"
+	if [ -z "${COOKIE_VAL}" ]; then
+		EX=1
+		echo "FAILED"
+		return
+	fi
+	echo "OK"
+
+	printf "Destroying Kerberos tickets before cookie-only test ... "
+	kdestroy -q > /dev/null 2>&1 || true
+	echo "OK"
+
+	printf "curl port %s/%s, cookie-only, no Kerberos ticket (expect 200)=" "${PORT}" "${SUBURL}"
+	rm -f "${CURL_OUTPUT}"
+	CODE="$(${CURL_NONEGOTIATE} \
+		-b "${COOKIE_NAME}=${COOKIE_VAL}" \
+		-o "${CURL_OUTPUT}" -w "%{http_code}" \
+		"http://${TEST_HOST_FQDN}:${PORT}/${SUBURL}")" || true
+	printf "%s ... " "${CODE}"
+	if [ "${CODE}" = "200" ]; then
+		echo "OK"
+	else
+		EX=1
+		echo "FAILED"
+		if [ -e "${CURL_OUTPUT}" ]; then cat "${CURL_OUTPUT}"; echo ""; fi
+		return
+	fi
+
+	printf "Cookie auth body='%s' (expect='%s') ... " \
+		"$(cat "${CURL_OUTPUT}" 2>/dev/null)" "${EXPECTED_BODY}"
+	if [ "$(cat "${CURL_OUTPUT}" 2>/dev/null)" = "${EXPECTED_BODY}" ]; then
+		echo "OK"
+	else
+		EX=1
+		echo "FAILED"
+	fi
+
+	printf "curl port %s/%s, tampered cookie (expect 401)=" \
+		"${PORT}" "${SUBURL}"
+	rm -f "${CURL_OUTPUT}"
+	CODE="$(${CURL_NONEGOTIATE} \
+		-b "${COOKIE_NAME}=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" \
+		-o "${CURL_OUTPUT}" -w "%{http_code}" \
+		"http://${TEST_HOST_FQDN}:${PORT}/${SUBURL}")" || true
+	printf "%s ... " "${CODE}"
+	if [ "${CODE}" = "401" ]; then
+		echo "OK"
+	else
+		EX=1
+		echo "FAILED"
+	fi
+}
+
+
 printf "Destroying Kerberos tickets ... "
 kdestroy -q > /dev/null 2>&1 || true
 echo "OK"
@@ -2496,6 +2710,85 @@ test_path "delegate.php" 401 200
 test_ldapwhoami "alice"
 test_path "export_check.php" 401 200 "${CURL_NEGOTIATE_DELEGATE}"
 test_export_check "alice"
+
+
+echo ""
+echo "=== Session cookie tests ==="
+echo ""
+
+if [ "${SESSION_COOKIES}" = yes ]; then
+	printf "Obtaining Kerberos ticket for alice ... "
+	if kinit -kt krb5.alice.keytab alice; then
+		echo "OK"
+	else
+		EX=1
+		echo "FAILED"
+	fi
+
+	test_session_cookie "session.php" 8081 "alice@${KERBEROS_REALM}"
+
+	# Test that a cookie-authenticated request survives an internal redirect to a
+	# location that has cookies disabled but allow_basic_fallback on.  The module
+	# must call save_login() after cookie auth so restore_login() can recover the
+	# ctx on the redirected access check; without it the bogus Authorization header
+	# written by set_bogus_authorization() would be parsed as Basic credentials and
+	# rejected with 401. The cookie comes from session.php (same key and cookie
+	# name), as a response after an internal redirect carries no Set-Cookie.
+	printf "Session cookie auth survives redirect to no-cookie location ... "
+	kinit -kt krb5.alice.keytab alice || die
+	TMPHEADERS_REDIR="$(mktemp)"
+	CODE="$(${CURL_NEGOTIATE} -D "${TMPHEADERS_REDIR}" -o "${CURL_OUTPUT}" \
+		-w "%{http_code}" \
+		"http://${TEST_HOST_FQDN}:8081/session.php")" || true
+	COOKIE_REDIR_VAL="$(grep -i "^Set-Cookie: gss_session=" "${TMPHEADERS_REDIR}" \
+		| head -1 \
+		| sed 's/^[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]: gss_session=//i' \
+		| sed 's/;.*//' | tr -d '\r')"
+	rm -f "${TMPHEADERS_REDIR}"
+	kdestroy -q > /dev/null 2>&1 || true
+	CODE="$(${CURL_NONEGOTIATE} \
+		-b "gss_session=${COOKIE_REDIR_VAL}" \
+		-o "${CURL_OUTPUT}" -w "%{http_code}" \
+		"http://${TEST_HOST_FQDN}:8081/cookie_redir.html")" || true
+	if [ "${CODE}" = "200" ] && \
+	   [ "$(cat "${CURL_OUTPUT}")" = "cookie_redirect_ok" ]; then
+		echo "OK"
+	else
+		EX=1
+		echo "FAILED (code=${CODE}, body=$(cat "${CURL_OUTPUT}" 2>/dev/null))"
+	fi
+
+	printf "Destroying Kerberos tickets ... "
+	kdestroy -q > /dev/null 2>&1 || true
+	echo "OK"
+
+	# With no ticket and no valid cookie, session endpoint returns 401.
+	echo ""
+	echo "--- Session endpoint without ticket or cookie (expect 401/401) ---"
+	test_path_on_port()
+	{
+		SUBURL="$1"
+		PORT="$2"
+		EXPECT1="$3"
+		EXPECT2="$4"
+		CURL_NEG="${5:-${CURL_NEGOTIATE}}"
+
+		printf "curl port %s/%s, no negotiate (expect %s)=" "${PORT}" "${SUBURL}" "${EXPECT1}"
+		rm -f "${CURL_OUTPUT}"
+		CODE="$($CURL_NONEGOTIATE -w "%{http_code}" "http://${TEST_HOST_FQDN}:${PORT}/${SUBURL}")" || true
+		printf "%s ... " "${CODE}"
+		if [ "$CODE" = "${EXPECT1}" ]; then echo "OK"; else EX=1; echo "FAILED"; fi
+
+		printf "curl port %s/%s, negotiate (expect %s)=" "${PORT}" "${SUBURL}" "${EXPECT2}"
+		rm -f "${CURL_OUTPUT}"
+		CODE="$($CURL_NEG -w "%{http_code}" "http://${TEST_HOST_FQDN}:${PORT}/${SUBURL}")" || true
+		printf "%s ... " "${CODE}"
+		if [ "$CODE" = "${EXPECT2}" ]; then echo "OK"; else EX=1; echo "FAILED"; fi
+	}
+	test_path_on_port "session.php" 8081 401 401
+else
+	echo "Skipping session cookie tests: AES-256-GCM-SIV unavailable"
+fi
 
 
 echo ""
