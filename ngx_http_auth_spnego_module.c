@@ -39,6 +39,9 @@
 #if (NGX_HTTP_SSL)
 #include <ngx_event_openssl.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/core_names.h>
+#include <openssl/rand.h>
 #include <openssl/objects.h>
 #include <openssl/x509.h>
 #endif
@@ -51,6 +54,7 @@
 
 #define CCACHE_VARIABLE_NAME "krb5_cc_name"
 #define CRED_EXPORT_VARIABLE_NAME "krb5_exported_cred"
+#define SESSION_PRINCIPAL_VARIABLE_NAME "krb5_session_principal"
 #define RENEWAL_TIME 60
 #define BASIC_AUTH_TKT_LIFE 60  /* 1 minute; credential is discarded after password verification */
 
@@ -98,6 +102,30 @@ static ngx_int_t ngx_http_auth_spnego_add_www_authenticate(ngx_http_request_t *r
                                                             ngx_str_t *value,
                                                             ngx_uint_t hash);
 
+static int
+ngx_http_auth_spnego_hex_decode(const u_char *hex, uint8_t *out, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        u_char hi = hex[2 * i], lo = hex[2 * i + 1];
+        if (!((hi >= '0' && hi <= '9') || (hi >= 'a' && hi <= 'f')
+              || (hi >= 'A' && hi <= 'F'))
+            || !((lo >= '0' && lo <= '9') || (lo >= 'a' && lo <= 'f')
+                 || (lo >= 'A' && lo <= 'F')))
+        {
+            return NGX_ERROR;
+        }
+        hi = (hi >= 'a') ? (hi - 'a' + 10) :
+             (hi >= 'A') ? (hi - 'A' + 10) : (hi - '0');
+        lo = (lo >= 'a') ? (lo - 'a' + 10) :
+             (lo >= 'A') ? (lo - 'A' + 10) : (lo - '0');
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return NGX_OK;
+}
+
+
+
 static const char *get_gss_error(ngx_pool_t *p, OM_uint32 error_status, char *prefix) {
     OM_uint32 maj_stat, min_stat;
     OM_uint32 msg_ctx = 0;
@@ -132,6 +160,9 @@ typedef struct {
     ngx_int_t head;              /* non-zero flag if headers set */
     ngx_int_t ret;               /* current return code */
     ngx_str_t token_out_b64;     /* base64 encoded output token */
+    ngx_str_t session_cookie_val;  /* encrypted value to emit as Set-Cookie */
+    ngx_str_t session_cookie_name; /* cookie name (from alcf, no copy) */
+    ngx_int_t session_expiry;      /* Max-Age seconds for Set-Cookie */
     ngx_str_t user;              /* authenticated username */
     ngx_str_t authorization_set; /* copy of the header value after login */
     ngx_str_t ccache;            /* delegated cache name, kept across refusals */
@@ -164,6 +195,22 @@ typedef struct ngx_http_auth_spnego_loc_conf_s {
     gss_cred_id_t constrained_creds;  /* service TGT for S4U2Proxy */
 #endif
     ngx_uint_t channel_binding;       /* NGX_HTTP_AUTH_SPNEGO_CB_* */
+    /* session cookie (requires OpenSSL / NGX_HTTP_SSL) */
+    ngx_str_t session_key;            /* 64-char hex AES-256-GCM key (inline) */
+    ngx_str_t session_key_file;       /* path to file containing 64-char hex key */
+    uint8_t session_key_bytes[32];    /* decoded master key */
+    uint8_t session_enc_key[32];      /* AES-256-GCM subkey derived from session_key_bytes */
+    uint8_t session_mac_key[32];      /* HMAC-SHA256 subkey derived from session_key_bytes */
+    u_char *session_aad;              /* "cookie_name\0service_principal" — see merge_loc_conf */
+    size_t  session_aad_len;
+#if (NGX_HTTP_SSL)
+    EVP_CIPHER *session_cipher;       /* cached AES-256-GCM-SIV (NULL if !session_key_loaded) */
+    EVP_MAC    *session_mac;          /* cached HMAC (NULL if !session_key_loaded) */
+#endif
+    ngx_str_t session_cookie_name;    /* cookie name, default "gss_session" */
+    ngx_str_t session_cookie_attrs;   /* Set-Cookie attributes appended after Max-Age */
+    ngx_int_t session_expiry;         /* cookie Max-Age in seconds; 0 = disabled */
+    ngx_uint_t session_key_loaded;    /* 1 when enc/mac subkeys are ready */
 } ngx_http_auth_spnego_loc_conf_t;
 
 static void ngx_http_auth_spnego_strip_realm(ngx_http_request_t *,
@@ -265,6 +312,27 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, deleg_ccache_dir), NULL},
+
+    {ngx_string("auth_gss_session_key"), SPNEGO_NGX_CONF_FLAGS,
+     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_auth_spnego_loc_conf_t, session_key), NULL},
+
+    {ngx_string("auth_gss_session_key_file"), SPNEGO_NGX_CONF_FLAGS,
+     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_auth_spnego_loc_conf_t, session_key_file), NULL},
+
+    {ngx_string("auth_gss_session_cookie_name"), SPNEGO_NGX_CONF_FLAGS,
+     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_auth_spnego_loc_conf_t, session_cookie_name), NULL},
+
+    {ngx_string("auth_gss_session_cookie_attrs"), SPNEGO_NGX_CONF_FLAGS,
+     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_auth_spnego_loc_conf_t, session_cookie_attrs), NULL},
+
+    {ngx_string("auth_gss_session_expiry"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_num_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_auth_spnego_loc_conf_t, session_expiry), NULL},
 
     ngx_null_command};
 
@@ -371,9 +439,26 @@ static void *ngx_http_auth_spnego_create_loc_conf(ngx_conf_t *cf) {
     conf->constrained_creds = GSS_C_NO_CREDENTIAL;
 #endif
     conf->channel_binding = NGX_CONF_UNSET_UINT;
+    conf->session_expiry = NGX_CONF_UNSET;
 
     return conf;
 }
+
+#if (NGX_HTTP_SSL)
+static void
+ngx_http_auth_spnego_release_session_objects(void *data)
+{
+    ngx_http_auth_spnego_loc_conf_t *alcf = data;
+    EVP_CIPHER_free(alcf->session_cipher);
+    EVP_MAC_free(alcf->session_mac);
+    /* Wipe key material before the pool reclaims the storage, so stale
+     * key bytes don't linger in freed pool memory available for reuse. */
+    ngx_explicit_memzero(alcf->session_key_bytes, sizeof(alcf->session_key_bytes));
+    ngx_explicit_memzero(alcf->session_enc_key,   sizeof(alcf->session_enc_key));
+    ngx_explicit_memzero(alcf->session_mac_key,   sizeof(alcf->session_mac_key));
+    ngx_explicit_memzero(alcf->session_key.data, alcf->session_key.len);
+}
+#endif
 
 static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
                                                  void *child) {
@@ -543,6 +628,241 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_conf_merge_uint_value(conf->channel_binding,
                               prev->channel_binding,
                               NGX_HTTP_AUTH_SPNEGO_CB_OFF);
+    ngx_conf_merge_str_value(conf->session_key, prev->session_key, "");
+    ngx_conf_merge_str_value(conf->session_key_file, prev->session_key_file, "");
+    ngx_conf_merge_str_value(conf->session_cookie_name, prev->session_cookie_name,
+                             "gss_session");
+    ngx_conf_merge_str_value(conf->session_cookie_attrs, prev->session_cookie_attrs,
+                             "HttpOnly; Path=/; Secure; SameSite=Lax");
+    ngx_conf_merge_value(conf->session_expiry, prev->session_expiry, 0);
+
+    if (conf->session_key.len > 0 && conf->session_key_file.len > 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "auth_gss_session_key and auth_gss_session_key_file "
+                           "are mutually exclusive");
+        return NGX_CONF_ERROR;
+    }
+
+    {
+        int have_key = 0;
+
+        if (conf->session_key_file.len > 0) {
+            u_char          *path;
+            ngx_fd_t         fd;
+            ssize_t          n;
+            char             buf[66]; /* 64 hex + optional newline + NUL */
+            size_t           hex_len;
+            ngx_file_info_t  fi;
+
+            path = ngx_pnalloc(cf->pool, conf->session_key_file.len + 1);
+            if (path == NULL)
+                return NGX_CONF_ERROR;
+            ngx_memcpy(path, conf->session_key_file.data,
+                       conf->session_key_file.len);
+            path[conf->session_key_file.len] = '\0';
+
+            fd = ngx_open_file(path, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+            if (fd == NGX_INVALID_FILE) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                                   "auth_gss_session_key_file: "
+                                   ngx_open_file_n " \"%s\" failed", path);
+                return NGX_CONF_ERROR;
+            }
+
+            if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                                   "auth_gss_session_key_file: "
+                                   ngx_fd_info_n " \"%s\" failed", path);
+                ngx_close_file(fd);
+                return NGX_CONF_ERROR;
+            }
+
+            /* Always 0 on Windows, where POSIX permissions don't apply */
+            if (ngx_file_access(&fi) & 077) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "auth_gss_session_key_file \"%s\": "
+                                   "mode allows group/other access", path);
+                ngx_close_file(fd);
+                return NGX_CONF_ERROR;
+            }
+
+            n = ngx_read_fd(fd, buf, sizeof(buf) - 1);
+            ngx_close_file(fd);
+
+            if (n == -1) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                                   "auth_gss_session_key_file: "
+                                   ngx_read_fd_n " \"%s\" failed", path);
+                return NGX_CONF_ERROR;
+            }
+
+            buf[n] = '\0';
+            hex_len = (size_t)n;
+
+            while (hex_len > 0
+                   && (buf[hex_len - 1] == '\n' || buf[hex_len - 1] == '\r'))
+                hex_len--;
+
+            if (hex_len != 64
+                || ngx_http_auth_spnego_hex_decode((u_char *)buf,
+                                                   conf->session_key_bytes,
+                                                   32) != NGX_OK)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "auth_gss_session_key_file \"%s\" must "
+                                   "contain exactly 64 hex characters",
+                                   path);
+                return NGX_CONF_ERROR;
+            }
+
+            have_key = 1;
+
+        } else if (conf->session_key.len == 64) {
+            if (ngx_http_auth_spnego_hex_decode(conf->session_key.data,
+                                                conf->session_key_bytes,
+                                                32) != NGX_OK)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "auth_gss_session_key contains "
+                                   "non-hex characters");
+                return NGX_CONF_ERROR;
+            }
+            have_key = 1;
+
+        } else if (conf->session_key.len > 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "auth_gss_session_key must be exactly 64 hex "
+                               "characters (32-byte AES-256 key), got %uz",
+                               conf->session_key.len);
+            return NGX_CONF_ERROR;
+        }
+
+        if (have_key) {
+#if (NGX_HTTP_SSL)
+            static const char enc_info[] = "spnego-session-enc";
+            static const char mac_info[] = "spnego-session-mac";
+            EVP_KDF     *kdf;
+            EVP_KDF_CTX *kctx;
+            OSSL_PARAM   params[4];
+
+            kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
+            if (kdf == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "auth_spnego: HKDF unavailable");
+                return NGX_CONF_ERROR;
+            }
+
+            params[0] = OSSL_PARAM_construct_utf8_string(
+                            OSSL_KDF_PARAM_DIGEST, "SHA256", 0);
+            params[1] = OSSL_PARAM_construct_octet_string(
+                            OSSL_KDF_PARAM_KEY,
+                            conf->session_key_bytes, 32);
+            params[2] = OSSL_PARAM_construct_octet_string(
+                            OSSL_KDF_PARAM_INFO,
+                            (void *)enc_info, sizeof(enc_info) - 1);
+            params[3] = OSSL_PARAM_construct_end();
+
+            kctx = EVP_KDF_CTX_new(kdf);
+            if (kctx == NULL
+                || EVP_KDF_derive(kctx, conf->session_enc_key, 32,
+                                  params) != 1)
+            {
+                EVP_KDF_CTX_free(kctx);
+                EVP_KDF_free(kdf);
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "auth_spnego: HKDF enc key derivation failed");
+                return NGX_CONF_ERROR;
+            }
+            EVP_KDF_CTX_free(kctx);
+
+            params[2] = OSSL_PARAM_construct_octet_string(
+                            OSSL_KDF_PARAM_INFO,
+                            (void *)mac_info, sizeof(mac_info) - 1);
+
+            kctx = EVP_KDF_CTX_new(kdf);
+            if (kctx == NULL
+                || EVP_KDF_derive(kctx, conf->session_mac_key, 32,
+                                  params) != 1)
+            {
+                EVP_KDF_CTX_free(kctx);
+                EVP_KDF_free(kdf);
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "auth_spnego: HKDF mac key derivation failed");
+                return NGX_CONF_ERROR;
+            }
+            EVP_KDF_CTX_free(kctx);
+            EVP_KDF_free(kdf);
+            conf->session_key_loaded = 1;
+
+            conf->session_cipher = EVP_CIPHER_fetch(NULL, "AES-256-GCM-SIV", NULL);
+            conf->session_mac    = EVP_MAC_fetch(NULL, "HMAC", NULL);
+            if (conf->session_cipher == NULL || conf->session_mac == NULL) {
+                if (conf->session_cipher == NULL) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "auth_spnego: session cookies require "
+                                       "the AES-256-GCM-SIV cipher, which needs "
+                                       "OpenSSL 3.2 or later");
+                } else {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "auth_spnego: session cookies require "
+                                       "HMAC, which OpenSSL does not provide");
+                }
+                EVP_CIPHER_free(conf->session_cipher);
+                EVP_MAC_free(conf->session_mac);
+                return NGX_CONF_ERROR;
+            }
+
+            ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(cf->pool, 0);
+            if (cln == NULL)
+                return NGX_CONF_ERROR;
+            cln->handler = ngx_http_auth_spnego_release_session_objects;
+            cln->data    = conf;
+#endif
+
+            /* AAD = cookie_name || '\0' || service_principal.
+             *
+             * Binds each cookie cryptographically to the specific service
+             * that minted it.  The service principal (HTTP/hostname@REALM)
+             * uniquely identifies the SPNEGO service, so a master key
+             * accidentally shared between unrelated services won't produce
+             * interchangeable cookies — AEAD verification fails on the
+             * mismatched AAD before any plaintext is exposed.  Cluster
+             * behavior is preserved: load-balanced replicas of the same
+             * service share the same SPN, so AAD matches and cookies remain
+             * portable across nodes.
+             *
+             * service_principal is NULL when auth_gss_allow_basic_fallback
+             * is off and no auth_gss_service_name is set (the GSS acceptor
+             * then matches any keytab entry via GSS_C_NO_NAME).  Cookies
+             * need a concrete service identity to bind to, so require
+             * auth_gss_service_name to be set in that case. */
+            if (conf->service_principal == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "auth_gss_session_key requires "
+                                   "auth_gss_service_name to be set");
+                return NGX_CONF_ERROR;
+            }
+
+            {
+                size_t spn_len = ngx_strlen(conf->service_principal);
+                u_char *p;
+
+                conf->session_aad_len = conf->session_cookie_name.len
+                                        + 1 + spn_len;
+                conf->session_aad = ngx_pnalloc(cf->pool,
+                                                conf->session_aad_len);
+                if (conf->session_aad == NULL)
+                    return NGX_CONF_ERROR;
+
+                p = ngx_cpymem(conf->session_aad,
+                               conf->session_cookie_name.data,
+                               conf->session_cookie_name.len);
+                *p++ = '\0';
+                ngx_memcpy(p, conf->service_principal, spn_len);
+            }
+        }
+    }
+
 #if (NGX_DEBUG)
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "auth_spnego: protect = %i",
                        conf->protect);
@@ -711,6 +1031,15 @@ static ngx_int_t ngx_http_auth_spnego_get_handler(ngx_http_request_t *r,
 }
 
 
+/* The other module variables hold a plain value for the current request,
+ * stored by ngx_http_auth_spnego_set_variable(). */
+static ngx_int_t ngx_http_auth_spnego_get_plain_handler(ngx_http_request_t *r,
+                                                        ngx_http_variable_value_t *v,
+                                                        uintptr_t data) {
+    return NGX_OK;
+}
+
+
 /* Keep the module's variable with its login so a refusal cannot destroy the
  * name needed by a later accepting destination. Invalidate indexed storage
  * so a redirect cannot bypass the getter's checks. */
@@ -719,6 +1048,26 @@ static ngx_int_t ngx_http_auth_spnego_set_variable(ngx_http_request_t *r,
                                                    ngx_str_t *value) {
     ngx_http_auth_spnego_ctx_t *ctx;
     ngx_http_variable_value_t *v;
+
+    if (name->len != sizeof(CCACHE_VARIABLE_NAME) - 1
+        || ngx_strncmp(name->data, CCACHE_VARIABLE_NAME, name->len) != 0)
+    {
+        /* All callers pass static lowercase string literals, as
+         * ngx_http_get_variable() does a byte-for-byte compare against the
+         * stored (lowercased) name. */
+        v = ngx_http_get_variable(r, name, ngx_hash_key(name->data, name->len));
+        if (v == NULL) {
+            return NGX_ERROR;
+        }
+
+        v->len = value->len;
+        v->data = value->data;
+        v->valid = 1;
+        v->not_found = 0;
+        v->no_cacheable = 1;
+
+        return NGX_OK;
+    }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_auth_spnego_module);
     if (ctx != NULL) {
@@ -734,7 +1083,8 @@ static ngx_int_t ngx_http_auth_spnego_set_variable(ngx_http_request_t *r,
 
 
 static ngx_int_t ngx_http_auth_spnego_add_variable(ngx_conf_t *cf,
-                                                   ngx_str_t *name) {
+                                                   ngx_str_t *name,
+                                                   ngx_http_get_variable_pt get) {
     ngx_http_variable_t *var =
         ngx_http_add_variable(cf, name, NGX_HTTP_VAR_NOCACHEABLE);
 
@@ -742,7 +1092,7 @@ static ngx_int_t ngx_http_auth_spnego_add_variable(ngx_conf_t *cf,
         return NGX_ERROR;
     }
 
-    var->get_handler = ngx_http_auth_spnego_get_handler;
+    var->get_handler = get;
     var->data = 0;
 
     return NGX_OK;
@@ -766,7 +1116,9 @@ static ngx_int_t ngx_http_auth_spnego_init(ngx_conf_t *cf) {
     *h = ngx_http_auth_spnego_handler;
 
     ngx_str_t var_name = ngx_string(CCACHE_VARIABLE_NAME);
-    if (ngx_http_auth_spnego_add_variable(cf, &var_name) != NGX_OK) {
+    if (ngx_http_auth_spnego_add_variable(cf, &var_name,
+                                          ngx_http_auth_spnego_get_handler)
+        != NGX_OK) {
         return NGX_ERROR;
     }
 
@@ -777,6 +1129,13 @@ static ngx_int_t ngx_http_auth_spnego_init(ngx_conf_t *cf) {
         if (ev == NULL)
             return NGX_ERROR;
         ev->get_handler = ngx_http_auth_spnego_exported_cred_variable;
+    }
+
+    ngx_str_t session_principal_var = ngx_string(SESSION_PRINCIPAL_VARIABLE_NAME);
+    if (ngx_http_auth_spnego_add_variable(cf, &session_principal_var,
+                                          ngx_http_auth_spnego_get_plain_handler)
+        != NGX_OK) {
+        return NGX_ERROR;
     }
 
     return NGX_OK;
@@ -859,12 +1218,14 @@ ngx_http_auth_spnego_saved_ccache(ngx_http_request_t *r) {
 static ngx_int_t
 ngx_http_auth_spnego_header_filter(ngx_http_request_t *r)
 {
-    ngx_http_auth_spnego_ctx_t *ctx;
+    ngx_http_auth_spnego_ctx_t      *ctx;
+    ngx_http_auth_spnego_loc_conf_t *alcf;
     ngx_str_t value;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_auth_spnego_module);
+    alcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_spnego_module);
 
-    if (ctx == NULL || ctx->ret != NGX_OK || ctx->token_out_b64.len == 0) {
+    if (ctx == NULL) {
         return ngx_http_next_header_filter(r);
     }
 
@@ -877,15 +1238,65 @@ ngx_http_auth_spnego_header_filter(ngx_http_request_t *r)
         }
     }
 
-    value.len = sizeof("Negotiate ") - 1 + ctx->token_out_b64.len;
-    value.data = ngx_pnalloc(r->pool, value.len);
-    if (value.data == NULL) {
-        return NGX_ERROR;
-    }
-    ngx_snprintf(value.data, value.len, "Negotiate %V", &ctx->token_out_b64);
+    if (ctx->ret == NGX_OK && ctx->token_out_b64.len > 0) {
+        value.len = sizeof("Negotiate ") - 1 + ctx->token_out_b64.len;
+        value.data = ngx_pnalloc(r->pool, value.len);
+        if (value.data == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_snprintf(value.data, value.len, "Negotiate %V", &ctx->token_out_b64);
 
-    if (ngx_http_auth_spnego_add_www_authenticate(r, &value, 1) != NGX_OK) {
-        return NGX_ERROR;
+        if (ngx_http_auth_spnego_add_www_authenticate(r, &value, 1) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    if (ctx->session_cookie_val.len > 0 && ctx->ret == NGX_OK) {
+        ngx_table_elt_t *h;
+        /* Build: "<name>=<value>; Max-Age=<N>; <attrs>" */
+        static const char max_age_prefix[] = "; Max-Age=";
+        char max_age_str[NGX_INT_T_LEN + 1];
+        size_t max_age_len;
+
+        max_age_len = ngx_snprintf((u_char *)max_age_str, sizeof(max_age_str),
+                                   "%i%Z", (ngx_int_t)ctx->session_expiry)
+                      - (u_char *)max_age_str - 1;
+
+        value.len = ctx->session_cookie_name.len + 1 /* = */
+                    + ctx->session_cookie_val.len
+                    + (sizeof(max_age_prefix) - 1)
+                    + max_age_len
+                    + 2 /* "; " */
+                    + alcf->session_cookie_attrs.len;
+        value.data = ngx_pnalloc(r->pool, value.len);
+        if (value.data == NULL) {
+            return NGX_ERROR;
+        }
+
+        u_char *p = value.data;
+        p = ngx_cpymem(p, ctx->session_cookie_name.data,
+                       ctx->session_cookie_name.len);
+        *p++ = '=';
+        p = ngx_cpymem(p, ctx->session_cookie_val.data,
+                       ctx->session_cookie_val.len);
+        p = ngx_cpymem(p, max_age_prefix, sizeof(max_age_prefix) - 1);
+        p = ngx_cpymem(p, max_age_str, max_age_len);
+        *p++ = ';'; *p++ = ' ';
+        p = ngx_cpymem(p, alcf->session_cookie_attrs.data,
+                       alcf->session_cookie_attrs.len);
+        value.len = p - value.data;
+
+        h = ngx_list_push(&r->headers_out.headers);
+        if (h == NULL) {
+            return NGX_ERROR;
+        }
+        h->hash = 1;
+#if defined(nginx_version) && nginx_version >= 1023000
+        h->next = NULL;
+#endif
+        h->key.len = sizeof("Set-Cookie") - 1;
+        h->key.data = (u_char *)"Set-Cookie";
+        h->value = value;
     }
 
     return ngx_http_next_header_filter(r);
@@ -1229,6 +1640,505 @@ done:
 }
 
 
+
+
+
+#if (NGX_HTTP_SSL)
+
+#define SPNEGO_SESSION_NONCE_LEN  12
+#define SPNEGO_SESSION_TAG_LEN    16
+
+/* Fields stored in each encrypted session cookie. */
+typedef struct {
+    ngx_int_t  expiry;        /* Unix expiry timestamp */
+    char      *username;      /* local username ($remote_user), NUL-terminated */
+    char      *gssname;       /* full GSS name ($krb5_session_principal), NUL-terminated */
+    char      *ccname;        /* delegated ccache name, NUL-terminated, may be "" */
+    uint8_t    basichash[32]; /* HMAC-SHA256(key, user+'\0'+password), all-zeros if absent */
+    ngx_int_t  has_basichash; /* 1 if basichash is valid (Basic Auth session) */
+} ngx_http_auth_spnego_session_t;
+
+
+/*
+ * HMAC-SHA256(key[32], user + '\0' + password) → mac[32].
+ * Returns NGX_OK on success, NGX_ERROR otherwise.
+ */
+static ngx_int_t
+ngx_http_auth_spnego_session_hmac(ngx_pool_t *pool, const uint8_t *key,
+                                  EVP_MAC *m,
+                                  const u_char *user, size_t ulen,
+                                  const u_char *pwd,  size_t plen,
+                                  uint8_t mac[32])
+{
+    unsigned char  *data;
+    EVP_MAC_CTX    *mctx = NULL;
+    OSSL_PARAM      params[2];
+    size_t          mac_len = 32;
+    ngx_int_t       ret     = NGX_ERROR;
+
+    data = ngx_palloc(pool, ulen + 1 + plen);
+    if (data == NULL)
+        return NGX_ERROR;
+
+    ngx_memcpy(data, user, ulen);
+    data[ulen] = '\0';
+    ngx_memcpy(data + ulen + 1, pwd, plen);
+
+    mctx = EVP_MAC_CTX_new(m);
+    if (mctx == NULL)
+        goto done;
+
+    params[0] = OSSL_PARAM_construct_utf8_string(
+                    OSSL_MAC_PARAM_DIGEST, "SHA256", 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    if (EVP_MAC_init(mctx, key, 32, params) != 1)
+        goto done;
+    if (EVP_MAC_update(mctx, data, ulen + 1 + plen) != 1)
+        goto done;
+    if (EVP_MAC_final(mctx, mac, &mac_len, 32) != 1)
+        goto done;
+    ret = NGX_OK;
+
+done:
+    EVP_MAC_CTX_free(mctx);
+    ngx_explicit_memzero(data, ulen + 1 + plen);
+    return ret;
+}
+
+
+/*
+ * Write one netstring "<len>:<data>," into [*p, end).
+ * Advances *p past the written bytes.  Returns 1 on success, 0 if the buffer
+ * is too small.
+ */
+static int
+ngx_spnego_ns_write(u_char **p, u_char *end, const void *data, size_t dlen)
+{
+    u_char  nbuf[24];
+    size_t  nlen;
+
+    nlen = ngx_snprintf(nbuf, sizeof(nbuf), "%uz", dlen) - nbuf;
+    if ((size_t)(end - *p) < nlen + 1 + dlen + 1)
+        return 0;
+    ngx_memcpy(*p, nbuf, nlen);  *p += nlen;
+    **p = ':';                    (*p)++;
+    if (dlen)
+        ngx_memcpy(*p, data, dlen);
+    *p  += dlen;
+    **p  = ',';                   (*p)++;
+    return 1;
+}
+
+/*
+ * Read one netstring from [*p, end).
+ * On success sets *data_out / *len_out and advances *p.  Returns 1 on
+ * success, 0 on any parse error (missing colon/comma, truncated data, etc.).
+ * Length fields wider than 4 digits are rejected to avoid size_t overflow;
+ * the plaintext is capped at 2048 bytes, so no valid field is longer.
+ */
+static int
+ngx_spnego_ns_read(const u_char **p, const u_char *end,
+                   const u_char **data_out, size_t *len_out)
+{
+    const u_char *q   = *p;
+    size_t        len = 0;
+    int           nd  = 0;
+
+    while (q < end && *q >= '0' && *q <= '9') {
+        len = len * 10 + (*q - '0');
+        q++;
+        nd++;
+    }
+    if (nd == 0 || nd > 4 || q >= end || *q != ':')
+        return 0;
+    q++;  /* skip ':' */
+    if ((size_t)(end - q) < len + 1 || q[len] != ',')
+        return 0;
+    *data_out = q;
+    *len_out  = len;
+    *p = q + len + 1;
+    return 1;
+}
+
+
+/*
+ * Encrypt session data with AES-256-GCM-SIV and return the result as a
+ * base64 string suitable for a cookie value.
+ *
+ * Plaintext is 5 consecutive netstrings:
+ *   NS(expiry_ts) NS(ccname) NS(username) NS(gssname) NS(basichash)
+ *
+ * basichash: 32 raw bytes (HMAC-SHA256), or empty if absent.
+ * Binary layout: [12-byte nonce][ciphertext][16-byte GCM-SIV tag]
+ */
+static ngx_str_t
+ngx_http_auth_spnego_encrypt_session(ngx_pool_t *pool,
+                                     const uint8_t *key,
+                                     const EVP_CIPHER *aead,
+                                     const u_char *aad,
+                                     size_t aad_len,
+                                     const char *username,
+                                     const char *gssname,
+                                     const char *ccname,
+                                     const uint8_t *basichash,
+                                     ngx_int_t expiry_ts)
+{
+    ngx_str_t       result = ngx_null_string;
+    EVP_CIPHER_CTX *ctx    = NULL;
+    unsigned char   nonce[SPNEGO_SESSION_NONCE_LEN];
+    /* 2048 B cap: base64(nonce + 2048 + tag) ≈ 2768 B cookie value, safely under the 4096 B browser limit */
+    unsigned char   plaintext[2048];
+    int             pt_len, ct_len, fin_len;
+    u_char         *buf, *p;
+    size_t          buf_len;
+    ngx_str_t       raw;
+
+    {
+        u_char  expiry_buf[24];
+        size_t  expiry_len = ngx_snprintf(expiry_buf, sizeof(expiry_buf),
+                                          "%i", expiry_ts) - expiry_buf;
+        u_char *pt         = plaintext;
+        u_char *pt_end     = plaintext + sizeof(plaintext);
+
+        if (!ngx_spnego_ns_write(&pt, pt_end, expiry_buf, expiry_len)
+            || !ngx_spnego_ns_write(&pt, pt_end,
+                                    ccname ? ccname : "",
+                                    ccname ? ngx_strlen(ccname) : 0)
+            || !ngx_spnego_ns_write(&pt, pt_end, username, ngx_strlen(username))
+            || !ngx_spnego_ns_write(&pt, pt_end, gssname, ngx_strlen(gssname))
+            || !ngx_spnego_ns_write(&pt, pt_end,
+                                    basichash ? basichash : (const uint8_t *)"",
+                                    basichash ? 32 : 0))
+            goto done;
+
+        pt_len = (int)(pt - plaintext);
+    }
+
+    if (RAND_bytes(nonce, SPNEGO_SESSION_NONCE_LEN) != 1)
+        goto done;
+
+    ctx = EVP_CIPHER_CTX_new();
+    if (ctx == NULL)
+        goto done;
+
+    if (EVP_EncryptInit_ex(ctx, aead, NULL, NULL, NULL) != 1)
+        goto done;
+    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1)
+        goto done;
+    {
+        int aad_out;
+        if (EVP_EncryptUpdate(ctx, NULL, &aad_out,
+                              aad, (int)aad_len) != 1)
+            goto done;
+    }
+
+    buf_len = SPNEGO_SESSION_NONCE_LEN + pt_len + SPNEGO_SESSION_TAG_LEN;
+    buf = ngx_palloc(pool, buf_len);
+    if (buf == NULL)
+        goto done;
+
+    p = buf;
+    ngx_memcpy(p, nonce, SPNEGO_SESSION_NONCE_LEN);
+    p += SPNEGO_SESSION_NONCE_LEN;
+
+    if (EVP_EncryptUpdate(ctx, p, &ct_len, plaintext, pt_len) != 1)
+        goto done;
+    p += ct_len;
+
+    if (EVP_EncryptFinal_ex(ctx, p, &fin_len) != 1)
+        goto done;
+    p += fin_len;
+
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG,
+                             SPNEGO_SESSION_TAG_LEN, p) != 1)
+        goto done;
+
+    raw.data = buf;
+    raw.len  = buf_len;
+
+    result.len  = ngx_base64_encoded_length(buf_len);
+    result.data = ngx_palloc(pool, result.len + 1);
+    if (result.data == NULL) {
+        result = (ngx_str_t)ngx_null_string;
+        goto done;
+    }
+    ngx_encode_base64(&result, &raw);
+    result.data[result.len] = '\0';
+
+done:
+    ngx_explicit_memzero(plaintext, sizeof(plaintext));
+    EVP_CIPHER_CTX_free(ctx);
+    return result;
+}
+
+
+/*
+ * Decrypt and authenticate a session cookie value (base64-encoded).
+ * Returns a pool-allocated ngx_http_auth_spnego_session_t, or NULL on any
+ * error (decryption failure, bad MAC, or expired session).
+ */
+static ngx_http_auth_spnego_session_t *
+ngx_http_auth_spnego_decrypt_session(ngx_pool_t *pool,
+                                     const uint8_t *key,
+                                     const EVP_CIPHER *aead,
+                                     const u_char *aad,
+                                     size_t aad_len,
+                                     ngx_str_t *cookie_val)
+{
+    EVP_CIPHER_CTX                *ctx  = NULL;
+    ngx_str_t                      raw;
+    unsigned char                  tag[SPNEGO_SESSION_TAG_LEN];
+    unsigned char                  plaintext[2048];
+    ngx_http_auth_spnego_session_t *sess = NULL;
+    int                            pt_len, fin_len;
+    size_t                         ct_len_sz;
+
+    /* A valid cookie value is base64(nonce + ≤2048 + tag) ≈ 2768 bytes;
+     * reject anything larger before allocating its decoded buffer. */
+    if (cookie_val->len == 0 || cookie_val->len > 4096)
+        return NULL;
+
+    raw.len  = ngx_base64_decoded_length(cookie_val->len);
+    raw.data = ngx_palloc(pool, raw.len);
+    if (raw.data == NULL)
+        return NULL;
+
+    if (ngx_decode_base64(&raw, cookie_val) != NGX_OK)
+        return NULL;
+
+    if (raw.len < SPNEGO_SESSION_NONCE_LEN + 1 + SPNEGO_SESSION_TAG_LEN)
+        return NULL;
+
+    ct_len_sz = raw.len - SPNEGO_SESSION_NONCE_LEN - SPNEGO_SESSION_TAG_LEN;
+    if (ct_len_sz >= sizeof(plaintext))
+        return NULL;
+
+    ngx_memcpy(tag,
+               raw.data + SPNEGO_SESSION_NONCE_LEN + ct_len_sz,
+               SPNEGO_SESSION_TAG_LEN);
+
+    ctx = EVP_CIPHER_CTX_new();
+    if (ctx == NULL)
+        return NULL;
+
+    if (EVP_DecryptInit_ex(ctx, aead, NULL, NULL, NULL) != 1)
+        goto done;
+    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, raw.data) != 1)
+        goto done;
+    {
+        int aad_out;
+        if (EVP_DecryptUpdate(ctx, NULL, &aad_out,
+                              aad, (int)aad_len) != 1)
+            goto done;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
+                             SPNEGO_SESSION_TAG_LEN, tag) != 1)
+        goto done;
+    if (EVP_DecryptUpdate(ctx, plaintext, &pt_len,
+                          raw.data + SPNEGO_SESSION_NONCE_LEN,
+                          (int)ct_len_sz) != 1)
+        goto done;
+    if (EVP_DecryptFinal_ex(ctx, plaintext + pt_len, &fin_len) != 1)
+        goto done;
+
+    pt_len += fin_len;
+
+    /* Parse 5 netstring fields: expiry, ccname, username, gssname, basichash */
+    {
+        const u_char *p   = plaintext;
+        const u_char *end = plaintext + pt_len;
+        const u_char *f_data;
+        size_t        f_len;
+        ngx_int_t     expiry;
+        u_char       *cptr, *uptr, *gptr;
+
+        if (!ngx_spnego_ns_read(&p, end, &f_data, &f_len))
+            goto done;
+        expiry = ngx_atoi((u_char *)f_data, f_len);
+        if (expiry == NGX_ERROR || expiry < (ngx_int_t)ngx_time())
+            goto done;
+
+        if (!ngx_spnego_ns_read(&p, end, &f_data, &f_len))
+            goto done;
+        cptr = ngx_pnalloc(pool, f_len + 1);
+        if (cptr == NULL) goto done;
+        ngx_memcpy(cptr, f_data, f_len);
+        cptr[f_len] = '\0';
+
+        if (!ngx_spnego_ns_read(&p, end, &f_data, &f_len) || f_len == 0)
+            goto done;
+        uptr = ngx_pnalloc(pool, f_len + 1);
+        if (uptr == NULL) goto done;
+        ngx_memcpy(uptr, f_data, f_len);
+        uptr[f_len] = '\0';
+
+        if (!ngx_spnego_ns_read(&p, end, &f_data, &f_len) || f_len == 0)
+            goto done;
+        gptr = ngx_pnalloc(pool, f_len + 1);
+        if (gptr == NULL) goto done;
+        ngx_memcpy(gptr, f_data, f_len);
+        gptr[f_len] = '\0';
+
+        /* basichash: absent (0 bytes) or exactly 32 raw bytes */
+        if (!ngx_spnego_ns_read(&p, end, &f_data, &f_len))
+            goto done;
+        if (f_len != 0 && f_len != 32)
+            goto done;
+
+        sess = ngx_pcalloc(pool, sizeof(*sess));
+        if (sess == NULL) goto done;
+
+        sess->expiry    = expiry;
+        sess->ccname    = (char *)cptr;
+        sess->username  = (char *)uptr;
+        sess->gssname   = (char *)gptr;
+
+        if (f_len == 32) {
+            ngx_memcpy(sess->basichash, f_data, 32);
+            sess->has_basichash = 1;
+        }
+    }
+
+done:
+    ngx_explicit_memzero(plaintext, sizeof(plaintext));
+    EVP_CIPHER_CTX_free(ctx);
+    return sess;
+}
+
+
+/*
+ * Search the Cookie request header for a cookie named <name>.
+ * Returns the raw (URL-encoded) value, or ngx_null_string if not found.
+ */
+static ngx_str_t
+ngx_http_auth_spnego_find_cookie(ngx_http_request_t *r, ngx_str_t *name)
+{
+    ngx_str_t    result = ngx_null_string;
+    ngx_list_part_t *part;
+    ngx_table_elt_t *hdrs;
+    ngx_uint_t       i;
+
+    part = &r->headers_in.headers.part;
+    hdrs = part->elts;
+
+    for (i = 0; ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL)
+                break;
+            part = part->next;
+            hdrs = part->elts;
+            i = 0;
+        }
+        if (hdrs[i].hash == 0)
+            continue;
+        if (hdrs[i].key.len != sizeof("Cookie") - 1)
+            continue;
+        if (ngx_strncasecmp(hdrs[i].key.data, (u_char *)"Cookie",
+                            sizeof("Cookie") - 1) != 0)
+            continue;
+
+        /* scan this Cookie header's value */
+        u_char *p   = hdrs[i].value.data;
+        u_char *end = p + hdrs[i].value.len;
+
+        while (p < end) {
+            while (p < end && (*p == ' ' || *p == '\t'))
+                p++;
+            if (p >= end)
+                break;
+
+            u_char *eq = p;
+            while (eq < end && *eq != '=')
+                eq++;
+            if (eq >= end)
+                break;
+
+            size_t nlen = (size_t)(eq - p);
+            while (nlen > 0
+                   && (p[nlen - 1] == ' ' || p[nlen - 1] == '\t'))
+                nlen--;
+
+            u_char *semi = eq + 1;
+            while (semi < end && *semi != ';')
+                semi++;
+
+            if (nlen == name->len
+                && ngx_strncmp(p, name->data, nlen) == 0)
+            {
+                result.data = eq + 1;
+                result.len  = (size_t)(semi - (eq + 1));
+                while (result.len > 0 && *result.data == ' ') {
+                    result.data++;
+                    result.len--;
+                }
+                while (result.len > 0
+                       && result.data[result.len - 1] == ' ')
+                    result.len--;
+                /* RFC 6265 allows DQUOTE-wrapped values; strip a matching
+                 * pair so non-browser clients that quote the value still
+                 * decrypt correctly.  nginx's own cookie parser does not
+                 * strip these. */
+                if (result.len >= 2
+                    && result.data[0] == '"'
+                    && result.data[result.len - 1] == '"')
+                {
+                    result.data++;
+                    result.len -= 2;
+                }
+                return result;
+            }
+
+            p = semi;
+            if (p < end)
+                p++;  /* skip ';' */
+        }
+    }
+
+    return result;
+}
+#endif /* NGX_HTTP_SSL */
+
+#if (NGX_HTTP_SSL)
+static void
+ngx_http_auth_spnego_set_session_cookie(ngx_http_request_t *r,
+                                        ngx_http_auth_spnego_ctx_t *ctx,
+                                        ngx_http_auth_spnego_loc_conf_t *alcf,
+                                        OM_uint32 time_rec,
+                                        const char *gssname,
+                                        const uint8_t *basichash)
+{
+    if (!alcf->session_key_loaded || alcf->session_expiry <= 0
+        || r->headers_in.user.len == 0)
+        return;
+
+    char *user_nul = ngx_pnalloc(r->pool, r->headers_in.user.len + 1);
+    if (user_nul == NULL)
+        return;
+    ngx_memcpy(user_nul, r->headers_in.user.data, r->headers_in.user.len);
+    user_nul[r->headers_in.user.len] = '\0';
+
+    OM_uint32 ticket_secs = (time_rec == GSS_C_INDEFINITE)
+        ? (OM_uint32)alcf->session_expiry : time_rec;
+    ngx_int_t expiry_ts = (ngx_int_t)(ngx_time()
+        + ngx_min((OM_uint32)alcf->session_expiry, ticket_secs));
+
+    ctx->session_cookie_val = ngx_http_auth_spnego_encrypt_session(
+        r->pool, alcf->session_enc_key, alcf->session_cipher,
+        alcf->session_aad, alcf->session_aad_len,
+        user_nul,
+        gssname ? gssname : user_nul,
+        ctx->ccache.len > 0 ? (char *)ctx->ccache.data : "",
+        basichash,
+        expiry_ts);
+    ctx->session_cookie_name = alcf->session_cookie_name;
+    ctx->session_expiry      = (ngx_int_t)ngx_min((OM_uint32)alcf->session_expiry, ticket_secs);
+    if (ctx->session_cookie_val.len == 0)
+        spnego_log_error("failed to encrypt session cookie");
+}
+#endif /* NGX_HTTP_SSL */
+
+
 ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
                                      ngx_http_auth_spnego_ctx_t *ctx,
                                      ngx_http_auth_spnego_loc_conf_t *alcf) {
@@ -1237,7 +2147,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     ngx_str_t new_user;
     ngx_int_t ret = NGX_DECLINED;
 
-    OM_uint32 major_status, minor_status;
+    OM_uint32 major_status, minor_status, time_rec;
     gss_name_t    client_name    = GSS_C_NO_NAME;
     gss_name_t    service_name   = GSS_C_NO_NAME;
     gss_name_t    src_name       = GSS_C_NO_NAME;
@@ -1380,12 +2290,15 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         passwd_buf.length = r->headers_in.passwd.len;
     }
 
-    major_status = gss_acquire_cred_with_password(&minor_status, client_name,
-                                                   &passwd_buf,
-                                                   BASIC_AUTH_TKT_LIFE,
-                                                   GSS_C_NO_OID_SET,
-                                                   GSS_C_INITIATE,
-                                                   &user_cred, NULL, NULL);
+    {
+        OM_uint32 tkt_life = (alcf->session_key_loaded && alcf->session_expiry > 0)
+            ? (OM_uint32)alcf->session_expiry : BASIC_AUTH_TKT_LIFE;
+        major_status = gss_acquire_cred_with_password(&minor_status, client_name,
+                                                       &passwd_buf, tkt_life,
+                                                       GSS_C_NO_OID_SET,
+                                                       GSS_C_INITIATE,
+                                                       &user_cred, NULL, NULL);
+    }
     if (GSS_ERROR(major_status)) {
         spnego_log_error("Basic auth failed for \"%s\": %s",
                          (const char *)user.data,
@@ -1448,11 +2361,12 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
             spnego_error(NGX_ERROR);
         }
 
+        time_rec = GSS_C_INDEFINITE;
         major_status = gss_accept_sec_context(&minor_status, &accept_ctx,
                                               svc_cred, &token,
                                               GSS_C_NO_CHANNEL_BINDINGS,
                                               &src_name, NULL, &reply,
-                                              NULL, NULL, &delegated_cred);
+                                              NULL, &time_rec, &delegated_cred);
         gss_release_buffer(&minor_status, &token);
 
         if (GSS_ERROR(major_status)) {
@@ -1528,6 +2442,23 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         spnego_log_error("Failed to set $remote_user");
 
     spnego_debug0("ngx_http_auth_spnego_basic: returning NGX_OK");
+
+#if (NGX_HTTP_SSL)
+    {
+        uint8_t bh[32];
+        const uint8_t *bh_ptr = NULL;
+        if (alcf->session_key_loaded &&
+                ngx_http_auth_spnego_session_hmac(r->pool, alcf->session_mac_key,
+                        alcf->session_mac,
+                        r->headers_in.user.data, r->headers_in.user.len,
+                        r->headers_in.passwd.data, r->headers_in.passwd.len,
+                        bh) == NGX_OK)
+            bh_ptr = bh;
+        ngx_http_auth_spnego_set_session_cookie(r, ctx, alcf, time_rec,
+                                                name, bh_ptr);
+        ngx_explicit_memzero(bh, sizeof(bh));
+    }
+#endif
 
     ret = NGX_OK;
 
@@ -1620,8 +2551,22 @@ ngx_int_t ngx_http_auth_spnego_set_bogus_authorization(ngx_http_request_t *r) {
 
     ngx_snprintf(final.data, final.len, "Basic %V", &encoded);
 
-    /* WARNING clobbering authorization header value */
-    r->headers_in.authorization->value.len = final.len;
+    /* Set or clobber the Authorization header so that nginx's $remote_user
+     * machinery (ngx_http_auth_basic_user) can parse the username from it.
+     * Cookie-only requests have no Authorization header; create one. */
+    if (r->headers_in.authorization == NULL) {
+        ngx_table_elt_t *h = ngx_list_push(&r->headers_in.headers);
+        if (h == NULL)
+            return NGX_ERROR;
+        h->hash = 1;
+#if defined(nginx_version) && nginx_version >= 1023000
+        h->next = NULL;
+#endif
+        h->key.len  = sizeof("Authorization") - 1;
+        h->key.data = (u_char *)"Authorization";
+        r->headers_in.authorization = h;
+    }
+    r->headers_in.authorization->value.len  = final.len;
     r->headers_in.authorization->value.data = final.data;
 
     spnego_debug0(
@@ -1752,7 +2697,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
                                    ngx_http_auth_spnego_loc_conf_t *alcf) {
     ngx_int_t ret = NGX_DECLINED;
     ngx_str_t spnego_token = ngx_null_string;
-    OM_uint32 major_status, minor_status, ret_flags;
+    OM_uint32 major_status, minor_status, ret_flags, time_rec;
     gss_buffer_desc service = GSS_C_EMPTY_BUFFER;
     gss_name_t my_gss_name = GSS_C_NO_NAME;
 
@@ -1764,6 +2709,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     gss_name_t client_name = GSS_C_NO_NAME;
     gss_buffer_desc output_token = GSS_C_EMPTY_BUFFER;
     gss_channel_bindings_t cb;
+    char *gssname = NULL;
 
     if (ctx == NULL || ctx->token.len == 0)
         return ret;
@@ -1889,10 +2835,11 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 #endif
     }
 
+    time_rec = GSS_C_INDEFINITE;
     major_status = gss_accept_sec_context(
         &minor_status, &gss_context, my_gss_creds, &input_token,
         cb, &client_name, NULL, &output_token,
-        &ret_flags, NULL, &delegated_creds);
+        &ret_flags, &time_rec, &delegated_creds);
 
     if (GSS_ERROR(major_status)) {
         spnego_debug1("%s", get_gss_error(r->pool, minor_status,
@@ -1938,6 +2885,15 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         spnego_error(NGX_ERROR);
     }
 
+    /* Save full GSS name before map_to_local may replace output_token */
+    if (output_token.length > 0) {
+        gssname = ngx_pnalloc(r->pool, output_token.length + 1);
+        if (gssname != NULL) {
+            ngx_memcpy(gssname, output_token.value, output_token.length);
+            gssname[output_token.length] = '\0';
+        }
+    }
+
     if (output_token.length && alcf->map_to_local) {
         /* Apply local rules to map Kerberos Principals to short names */
         gss_release_buffer(&minor_status, &output_token);
@@ -1981,6 +2937,11 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     }
 
 
+#if (NGX_HTTP_SSL)
+    ngx_http_auth_spnego_set_session_cookie(r, ctx, alcf, time_rec,
+        gssname, NULL);
+#endif
+
     gss_release_buffer(&minor_status, &output_token);
     output_token = (gss_buffer_desc)GSS_C_EMPTY_BUFFER;
 
@@ -1988,7 +2949,6 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     goto end;
 
 end:
-
     if (output_token.length)
         gss_release_buffer(&minor_status, &output_token);
 
@@ -2373,6 +3333,101 @@ ngx_http_auth_spnego_authenticate(ngx_http_request_t *r,
         spnego_debug0("Already authenticated");
         return NGX_OK;
     }
+#if (NGX_HTTP_SSL)
+    /* Session cookie check: if a valid encrypted cookie is present, accept it
+     * without SPNEGO.  The cookie contains the verified principal name and an
+     * expiry timestamp protected by AES-256-GCM. */
+    if (alcf->session_key_loaded && alcf->session_expiry > 0) {
+        ngx_str_t cookie_val = ngx_http_auth_spnego_find_cookie(
+            r, &alcf->session_cookie_name);
+        if (cookie_val.len > 0) {
+            ngx_http_auth_spnego_session_t *sess =
+                ngx_http_auth_spnego_decrypt_session(
+                    r->pool, alcf->session_enc_key, alcf->session_cipher,
+                    alcf->session_aad, alcf->session_aad_len,
+                    &cookie_val);
+            if (sess != NULL && sess->has_basichash) {
+                /* Cookie was minted from a Basic Auth login.  Require the
+                 * client to keep presenting Basic credentials and verify
+                 * they still hash to the value baked into the cookie.
+                 * Matches mod_auth_gssapi's stance for Basic-derived
+                 * sessions (mod_auth_gssapi.c:1092-1100: cookie-only
+                 * acceptance excludes AUTH_TYPE_BASIC), closing the bare
+                 * stolen-cookie replay window for the Basic path.
+                 * SPNEGO-issued cookies have has_basichash=0 and bypass
+                 * this gate entirely. */
+                if (ngx_http_auth_basic_user(r) != NGX_OK) {
+                    spnego_debug0("Basic-derived session cookie without "
+                                  "Basic credentials; rejecting");
+                    sess = NULL;
+                } else if (r->headers_in.user.len != ngx_strlen(sess->username)
+                           || ngx_strncmp(r->headers_in.user.data,
+                                          sess->username,
+                                          r->headers_in.user.len) != 0) {
+                    spnego_debug0("Session cookie username mismatch");
+                    sess = NULL;
+                } else {
+                    uint8_t mac[32];
+                    bool hmac_ok =
+                        ngx_http_auth_spnego_session_hmac(
+                            r->pool, alcf->session_mac_key,
+                            alcf->session_mac,
+                            (u_char *)sess->username,
+                            ngx_strlen(sess->username),
+                            r->headers_in.passwd.data,
+                            r->headers_in.passwd.len,
+                            mac) == NGX_OK
+                        && CRYPTO_memcmp(mac, sess->basichash, 32) == 0;
+                    ngx_explicit_memzero(mac, sizeof(mac));
+                    if (!hmac_ok) {
+                        spnego_debug0("Session cookie basichash mismatch");
+                        sess = NULL;
+                    }
+                }
+            }
+            if (sess != NULL) {
+                spnego_debug1("Session cookie valid for %s", sess->username);
+
+                /* Set $krb5_session_principal from the stored full GSS name */
+                ngx_str_t sp_var   = ngx_string(SESSION_PRINCIPAL_VARIABLE_NAME);
+                ngx_str_t sp_value = { ngx_strlen(sess->gssname),
+                                       (u_char *)sess->gssname };
+                ngx_http_auth_spnego_set_variable(r, &sp_var, &sp_value);
+
+                /* Set $krb5_cc_name from the stored ccache path */
+                if (sess->ccname != NULL && sess->ccname[0] != '\0') {
+                    ngx_str_t cc_var   = ngx_string(CCACHE_VARIABLE_NAME);
+                    ngx_str_t cc_value = { ngx_strlen(sess->ccname),
+                                           (u_char *)sess->ccname };
+                    ngx_http_auth_spnego_set_variable(r, &cc_var, &cc_value);
+                }
+
+                /* Set $remote_user and accept the request */
+                r->headers_in.user.data = (u_char *)sess->username;
+                r->headers_in.user.len  = ngx_strlen(sess->username);
+
+                if (!ngx_spnego_authorized_principal(r, &r->headers_in.user,
+                                                     alcf)) {
+                    spnego_debug1("Session cookie principal not authorized: \"%V\"",
+                                 &r->headers_in.user);
+                    return (ctx->ret = NGX_HTTP_FORBIDDEN);
+                }
+
+                if (ngx_http_auth_spnego_set_bogus_authorization(r) != NGX_OK) {
+                    spnego_log_error("Failed to set remote_user from session");
+                } else if (ngx_http_auth_spnego_save_login(r, ctx, alcf)
+                           != NGX_OK) {
+                    spnego_log_error("Failed to save cookie login for redirect");
+                }
+
+                spnego_debug1("Session cookie auth succeeded for %s",
+                              sess->username);
+                return (ctx->ret = NGX_OK);
+            }
+            spnego_debug0("Session cookie present but invalid/expired");
+        }
+    }
+#endif /* NGX_HTTP_SSL */
     spnego_debug0("Begin auth");
 
     if (allow_basic) {
