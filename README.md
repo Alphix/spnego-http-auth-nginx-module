@@ -113,8 +113,9 @@ delegated Kerberos credentials.  It accepts four values:
 * `off` (default): credentials are neither captured nor used.
 * `unconstrained`: capture the client's forwarded TGT when the client sets
   the `GSS_C_DELEG_FLAG` in its SPNEGO token (i.e. the client opts in to
-  delegation).  The credential is stored in a temporary per-request ccache
-  file (destroyed once the request completes) and exposed via the
+  delegation).  The credential is stored as a FILE ccache under
+  `auth_gss_deleg_ccache_dir`, named after the authenticated principal and
+  overwritten on each successful delegation, and exposed via the
   `$krb5_cc_name` nginx variable.  It can also be passed to a backend
   in-memory via the `$krb5_cred_exported` nginx variable, which
   base64-encodes the credential on demand using `gss_export_cred()` without
@@ -143,6 +144,12 @@ Example — constrained delegation (S4U2Proxy):
 Constrained delegation requires a GSSAPI library that supports
 `gss_acquire_cred_from()` and `gss_store_cred_into()` (MIT Kerberos; planned
 for Heimdal 8).
+
+Files under `auth_gss_deleg_ccache_dir` are not removed by the module, so
+install `contrib/nginx-tmpfiles.conf` to `/etc/tmpfiles.d/` to have
+`systemd-tmpfiles` periodically delete ccache files for principals that
+haven't re-authenticated recently. The example file's `1d` age is a
+starting point; tune it to your deployment.
 
 
 Service Credential Cache
@@ -286,6 +293,131 @@ Restrict this directive to deployments where all clients are known to have
 proper support for channel bindings.
 
 
+Nginx Variables
+---------------
+
+The following variables are set by this module:
+
+* `$krb5_auth_type`: how the current request was authenticated.  Values:
+  `spnego` (Kerberos/SPNEGO negotiate), `basic` (HTTP Basic auth), or
+  `cookie` (session cookie).  Empty for unauthenticated requests.
+* `$krb5_cc_name`: path to the delegated credential ccache (see Credential
+  Delegation).
+* `$krb5_exported_cred`: base64-encoded exported credential blob (see
+  Credential Delegation and Security Considerations for $krb5_exported_cred).
+* `$krb5_session_principal`: the authenticated principal for
+  cookie-authenticated requests (see Session Cookie).
+
+
+Session Cookie
+--------------
+
+On deployments behind a load balancer every request would normally require a
+full SPNEGO round-trip.  The session cookie feature avoids this: after the
+first successful authentication nginx issues an AES-256-GCM encrypted cookie,
+and subsequent requests from any cluster node are authenticated using the cookie
+alone, without a SPNEGO handshake.
+
+To enable, configure a 32-byte key (64 hex digits) shared across all cluster
+nodes and a non-zero expiry:
+
+    auth_gss_session_key 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20;
+    auth_gss_session_expiry 3600;  # seconds; 0 = disabled
+
+Alternatively, load the key from a file (one 64-hex-char line):
+
+    auth_gss_session_key_file /etc/nginx/session.key;
+    auth_gss_session_expiry 3600;
+
+The actual cookie expiry is `min(auth_gss_session_expiry, remaining Kerberos ticket lifetime)`.
+
+`auth_gss_service_name` must also be set. It is baked into each cookie's
+authenticated associated data, binding the cookie to this specific service so
+that it cannot be replayed against another service that happens to share the
+same `auth_gss_session_key`. nginx refuses to start if
+`auth_gss_session_key`/`auth_gss_session_key_file` is set without
+`auth_gss_service_name`.
+
+Optional directives:
+
+* `auth_gss_session_cookie_name`: name of the cookie (default: `gss_session`).
+* `auth_gss_session_cookie_attrs`: Set-Cookie attributes appended after
+  `Max-Age` (default: `HttpOnly; Path=/; Secure; SameSite=Lax`).
+  Override this when nginx is behind a TLS-terminating load balancer and the
+  direct connection is plain HTTP — in that case the browser will never see
+  HTTPS and the `Secure` flag should be dropped or managed differently:
+
+      auth_gss_session_cookie_attrs "HttpOnly; Path=/; SameSite=Lax";
+
+The authenticated principal for cookie-authenticated requests is exposed as
+`$krb5_session_principal`.
+
+Session cookies require nginx to be built with `--with-http_ssl_module`
+(for OpenSSL AES-256-GCM support); the session directives are unavailable
+and ignored otherwise.
+
+### Security Considerations
+
+Session cookies are deliberately portable: the same cookie is accepted on
+any cluster node, over any connection, until `auth_gss_session_expiry`
+elapses. This has consequences worth understanding before enabling the
+feature:
+
+* **Bearer token.** Anyone who obtains a valid cookie value can use it until
+  it expires or the session key is rotated — there is no per-request proof
+  of possession (Basic-derived cookies are the exception: they also re-check
+  the client's password on every request). Treat the cookie value with the
+  same care as a short-lived password, and keep `HttpOnly` and `Secure` in
+  `auth_gss_session_cookie_attrs` unless you have a specific reason to drop
+  them.
+
+* **`Secure` only constrains browsers.** A party that already has the cookie
+  value (e.g. via XSS, or a compromised log) can replay it directly to a
+  plain-HTTP listener with a tool like curl, regardless of the `Secure`
+  attribute. If nginx terminates TLS itself, there is no plain-HTTP listener
+  to replay against. If nginx is a backend behind a TLS-terminating load
+  balancer (and therefore necessarily listens on plain HTTP towards the
+  balancer), make sure that listener is reachable only from the balancer —
+  the same network hygiene already required for trusting `X-Forwarded-For`
+  and similar headers.
+
+* **`auth_gss_channel_binding` does not extend to the cookie.** Channel
+  binding proves that a *specific SPNEGO handshake* happened over a
+  *specific TLS connection*. A session cookie minted from that handshake is,
+  by design, usable on any later connection, on any cluster node — that is
+  what makes it useful as a session cookie, but it also means the
+  channel-binding guarantee covers only the initial handshake, not the
+  lifetime of the session. If a location requires channel binding to hold
+  for the entire session, do not enable session cookies on it, or set a
+  short `auth_gss_session_expiry` to bound the window during which this
+  matters.
+
+Authorization
+-------------
+
+This module handles authentication (verifying who the user is) but does not
+provide authorization (deciding what the user is allowed to do).
+Authorization must be configured separately, for example using nginx's
+built-in `auth_request` directive, `access_by_lua_file`, or an external
+access-control system.
+
+An example Lua script that checks LDAP group membership after SPNEGO
+authentication is provided in `contrib/ldap_authz.lua`.  It requires
+`lua-resty-ldap` and the nginx Lua module.  To use it:
+
+    cp contrib/ldap_authz.lua /etc/nginx/lua/ldap_authz.lua
+
+Edit the configuration variables at the top of the script, then reference
+it from your nginx location block:
+
+    location /protected {
+        auth_gss on;
+        auth_gss_format_full on;
+        access_by_lua_file /etc/nginx/lua/ldap_authz.lua;
+    }
+
+
+
 Troubleshooting
 ---------------
 
@@ -368,6 +500,7 @@ Important Changes
 * Constrained delegation service TGT is now held in a per-worker in-memory ccache; the `auth_gss_service_ccache` file-based directive has been removed.
 * **Breaking change**: `auth_gss_delegate_credentials` and `auth_gss_constrained_delegation` replaced by `auth_gss_delegation` accepting `off`, `unconstrained`, `constrained`, or `both`.
 * New `auth_gss_deleg_ccache_dir` directive stores delegated credentials as named FILE ccaches; the ccache path is exposed via `$krb5_cc_name`.
+* Session cookie support: new `auth_gss_session_key`, `auth_gss_session_expiry`, and related directives; `$krb5_session_principal` variable for cookie-authenticated requests.
 
 
 Help
