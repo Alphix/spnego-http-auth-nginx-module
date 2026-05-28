@@ -190,6 +190,7 @@ typedef struct ngx_http_auth_spnego_loc_conf_s {
     ngx_uint_t delegation;            /* SPNEGO_DELEG_* */
     gss_cred_id_t constrained_creds;  /* service TGT for S4U2Proxy */
     ngx_uint_t channel_binding;       /* NGX_HTTP_AUTH_SPNEGO_CB_* */
+    ngx_str_t deleg_ccache_dir;       /* dir for NFS-backed delegation ccaches */
 } ngx_http_auth_spnego_loc_conf_t;
 
 static void ngx_http_auth_spnego_strip_realm(ngx_http_request_t *,
@@ -286,6 +287,11 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
      ngx_conf_set_enum_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, channel_binding),
      (void *) &ngx_http_auth_spnego_cb},
+
+    {ngx_string("auth_gss_deleg_ccache_dir"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_auth_spnego_loc_conf_t, deleg_ccache_dir), NULL},
 
     ngx_null_command};
 
@@ -514,6 +520,40 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
     ngx_conf_merge_uint_value(conf->delegation, prev->delegation,
                               SPNEGO_DELEG_OFF);
+    ngx_conf_merge_str_value(conf->deleg_ccache_dir, prev->deleg_ccache_dir, "");
+
+    if (conf->delegation != SPNEGO_DELEG_OFF
+        && conf->deleg_ccache_dir.len == 0)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "auth_gss_delegation requires "
+                           "auth_gss_deleg_ccache_dir to be set");
+        return NGX_CONF_ERROR;
+    }
+
+    if (conf->deleg_ccache_dir.len > 0) {
+        ngx_file_info_t fi;
+        if (ngx_file_info(conf->deleg_ccache_dir.data, &fi) == NGX_FILE_ERROR
+            || !ngx_is_dir(&fi))
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "auth_gss_deleg_ccache_dir \"%V\" does not "
+                               "exist or is not a directory",
+                               &conf->deleg_ccache_dir);
+            return NGX_CONF_ERROR;
+        }
+#if !(NGX_WIN32)
+        /* No portable nginx wrapper for this, and Windows uses ACLs; there
+         * a non-writable directory is only caught when storing a ccache. */
+        if (access((char *)conf->deleg_ccache_dir.data, W_OK | X_OK) != 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "auth_gss_deleg_ccache_dir \"%V\" is not "
+                               "writable", &conf->deleg_ccache_dir);
+            return NGX_CONF_ERROR;
+        }
+#endif
+    }
+
     ngx_conf_merge_uint_value(conf->channel_binding,
                               prev->channel_binding,
                               NGX_HTTP_AUTH_SPNEGO_CB_OFF);
@@ -1137,7 +1177,8 @@ ngx_http_auth_spnego_build_ccache_name(ngx_pool_t *pool, krb5_context kcontext,
 static ngx_int_t
 ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
                                            const char *principal_name,
-                                           creds_info delegated_creds) {
+                                           creds_info delegated_creds,
+                                           const char *ccache_dir) {
     krb5_context kcontext = NULL;
     krb5_principal principal = NULL;
     krb5_ccache ccache = NULL;
@@ -1164,10 +1205,19 @@ ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
         goto done;
     }
 
-    if ((kerr = krb5_cc_new_unique(kcontext, "FILE", NULL, &ccache))) {
-        spnego_log_error("Kerberos error: Cannot create unique ccache");
-        spnego_log_krb5_error(kcontext, kerr);
-        goto done;
+    {
+        char hint_buf[NGX_MAX_PATH];
+        const char *hint = NULL;
+        if (ccache_dir != NULL && ccache_dir[0] != '\0') {
+            ngx_snprintf((u_char *)hint_buf, sizeof(hint_buf),
+                         "%s/krb5cc_%Z", ccache_dir);
+            hint = hint_buf;
+        }
+        if ((kerr = krb5_cc_new_unique(kcontext, "FILE", hint, &ccache))) {
+            spnego_log_error("Kerberos error: Cannot create unique ccache");
+            spnego_log_krb5_error(kcontext, kerr);
+            goto done;
+        }
     }
 
     switch (delegated_creds.type) {
@@ -1498,7 +1548,8 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     if (alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED) {
         creds_info delegated_creds = {&creds, TYPE_KRB5_CREDS};
         if (ngx_http_auth_spnego_store_delegated_creds(r, name,
-                                                       delegated_creds) != NGX_OK) {
+                                                       delegated_creds,
+                                                       (char *)alcf->deleg_ccache_dir.data) != NGX_OK) {
             krb5_free_cred_contents(kcontext, &creds);
             spnego_error(NGX_ERROR);
         }
@@ -1968,7 +2019,8 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         if (alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED) {
             creds_info creds = {delegated_creds, TYPE_GSS_CRED_ID_T};
             if (ngx_http_auth_spnego_store_delegated_creds(r, username,
-                                                           creds) != NGX_OK) {
+                                                           creds,
+                                                           (char *)alcf->deleg_ccache_dir.data) != NGX_OK) {
                 spnego_error(NGX_ERROR);
             }
         }
@@ -2063,6 +2115,15 @@ ngx_http_auth_spnego_same_auth(ngx_http_auth_spnego_ctx_t *ctx,
     if (ctx->token.len == 0 && !b->allow_basic) {
         return false;
     }
+
+#ifdef NGX_HAVE_CRED_STORE
+    if (a->delegation & SPNEGO_DELEG_CONSTRAINED) {
+        if (!ngx_http_auth_spnego_same_string(&a->deleg_ccache_dir,
+                                              &b->deleg_ccache_dir)) {
+            return false;
+        }
+    }
+#endif
 
     if (a->service_principal == b->service_principal) {
         return true;

@@ -367,6 +367,7 @@ Important Changes
 * `$krb5_exported_cred`: new nginx variable to pass delegated Kerberos credentials in-memory to backends without writing a ccache file.
 * Constrained delegation service TGT is now held in a per-worker in-memory ccache; the `auth_gss_service_ccache` file-based directive has been removed.
 * **Breaking change**: `auth_gss_delegate_credentials` and `auth_gss_constrained_delegation` replaced by `auth_gss_delegation` accepting `off`, `unconstrained`, `constrained`, or `both`.
+* New `auth_gss_deleg_ccache_dir` directive stores delegated credentials as named FILE ccaches; the ccache path is exposed via `$krb5_cc_name`.
 
 
 Help
