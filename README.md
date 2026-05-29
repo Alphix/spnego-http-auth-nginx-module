@@ -501,6 +501,7 @@ Important Changes
 * **Breaking change**: `auth_gss_delegate_credentials` and `auth_gss_constrained_delegation` replaced by `auth_gss_delegation` accepting `off`, `unconstrained`, `constrained`, or `both`.
 * New `auth_gss_deleg_ccache_dir` directive stores delegated credentials as named FILE ccaches; the ccache path is exposed via `$krb5_cc_name`.
 * Session cookie support: new `auth_gss_session_key`, `auth_gss_session_expiry`, and related directives; `$krb5_session_principal` variable for cookie-authenticated requests.
+* New `$krb5_auth_type` variable reports how a request was authenticated: `spnego`, `basic`, or `cookie`.
 
 
 Help
