@@ -55,6 +55,18 @@ elif [ -n "${GITHUB_WORKSPACE}" ]; then
 	cd "${GITHUB_WORKSPACE}" || exit 1
 fi
 
+# Detect whether the installed module supports constrained delegation.
+# Constrained delegation requires gss_acquire_cred_from() with a client_keytab
+# GSS store element to acquire the service TGT for S4U2Proxy.  We detect this
+# by checking for the "client_keytab" string literal that is only present in
+# the constrained delegation code path.
+if strings /usr/lib/nginx/modules/ngx_http_auth_spnego_module.so \
+       2>/dev/null | grep -qF "client_keytab"; then
+    HAS_CONSTRAINED_DELEGATION=yes
+else
+    HAS_CONSTRAINED_DELEGATION=no
+fi
+
 
 cat <<EOF
 Test Configuration
@@ -419,8 +431,8 @@ redirect service auth_gss_service_name HTTP/other.${TEST_HOST_FQDN}
 redirect service-empty auth_gss_service_name ""
 redirect format auth_gss_format_full off
 redirect map auth_gss_map_to_local on
-redirect delegate auth_gss_delegate_credentials on
-delegate_chain constrained auth_gss_constrained_delegation off
+redirect delegate auth_gss_delegation unconstrained
+delegate_chain constrained auth_gss_delegation unconstrained
 delegate_chain service-empty auth_gss_service_name ""
 EOF
 )"
@@ -435,8 +447,7 @@ delegation_settings()
 		auth_gss_allow_basic_fallback off;
 		auth_gss_authorized_principal $1@${KERBEROS_REALM};
 		auth_gss_format_full on;
-		auth_gss_delegate_credentials on;
-		auth_gss_constrained_delegation on;
+		${DELEGATION_DIRECTIVE}
 EOF
 }
 
@@ -456,6 +467,13 @@ EOF
 		fi
 	done
 }
+
+if [ "$HAS_CONSTRAINED_DELEGATION" = "yes" ]; then
+    DELEGATION_DIRECTIVE="auth_gss_delegation both;"
+else
+    DELEGATION_DIRECTIVE="auth_gss_delegation unconstrained;"
+fi
+
 
 printf "Creating nginx test site ... "
 if ! cat <<EOF > /etc/nginx/sites-available/kerberos
@@ -522,8 +540,7 @@ server {
                 auth_gss_format_full on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
-                auth_gss_delegate_credentials on;
-                auth_gss_constrained_delegation on;
+                ${DELEGATION_DIRECTIVE}
 	}
 
 	# Tests credential delegation: delegated credentials are written to a
@@ -544,7 +561,7 @@ server {
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5_EXPORTED_CRED \$krb5_exported_cred;
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
-                auth_gss_delegate_credentials on;
+                auth_gss_delegation unconstrained;
 	}
 
 	# Channel binding directive on plain HTTP: no TLS session exists so the
@@ -719,8 +736,7 @@ $(delegation_settings bob)
                 auth_gss_service_name HTTP/${TEST_HOST_FQDN};
                 auth_gss_allow_basic_fallback off;
                 auth_gss_format_full on;
-                auth_gss_delegate_credentials on;
-                auth_gss_constrained_delegation on;
+                ${DELEGATION_DIRECTIVE}
                 index /assigned_ccache_copy.php;
 	}
 
@@ -820,7 +836,7 @@ $(delegation_settings alice)
 		auth_gss_authorized_principal bob@${KERBEROS_REALM};
 		auth_gss_authorized_principal alice@${KERBEROS_REALM};
 		auth_gss_format_full on;
-		auth_gss_delegate_credentials on;
+		auth_gss_delegation unconstrained;
 		index /delegate_copy_ok/check;
 		location /delegate_copy_ok/header/ {
 			index /header_bob_basic.php;
@@ -1307,7 +1323,7 @@ $(delegation_settings alice)
 		location /redirect/cache/ {
 			auth_gss_allow_basic_fallback on;
 			auth_gss_authorized_principal bob@${KERBEROS_REALM};
-			auth_gss_delegate_credentials on;
+			auth_gss_delegation unconstrained;
 			index /redirect/cache_denied.php;
 		}
 		location = /redirect/cache_denied.php {
@@ -1317,7 +1333,7 @@ $(delegation_settings alice)
 			satisfy any;
 			allow all;
 			auth_gss_allow_basic_fallback on;
-			auth_gss_delegate_credentials on;
+			auth_gss_delegation unconstrained;
 			fastcgi_param KRB5CCNAME \$krb5_cc_name;
 		}
 $(redirect_settings_locations redirect)
@@ -1464,12 +1480,11 @@ server {
 	auth_gss_allow_basic_fallback off;
 	auth_gss_authorized_principal alice@${KERBEROS_REALM};
 	auth_gss_format_full on;
-	auth_gss_delegate_credentials off;
+	auth_gss_delegation off;
 	set \$early_ccache \$krb5_cc_name;
 
 	location /server_rewrite_ccache/ {
-		auth_gss_delegate_credentials on;
-		auth_gss_constrained_delegation on;
+		${DELEGATION_DIRECTIVE}
 		index /public.php;
 
 		location /server_rewrite_ccache/clear/ {

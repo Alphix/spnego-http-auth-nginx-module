@@ -107,26 +107,38 @@ prompts for a username and password.
 Credential Delegation
 ---------------------
 
-User credentials can be delegated to nginx using the `auth_gss_delegate_credentials`
-directive.  When enabled, the delegated credential is stored in a temporary per-request
-ccache file (destroyed once the request completes) and exposed via the `$krb5_cc_name`
-nginx variable.  The credential can also be passed to a backend in-memory via the
-`$krb5_exported_cred` nginx variable, which base64-encodes the credential on demand
-using `gss_export_cred()` without exposing the ccache path.
+The `auth_gss_delegation` directive controls whether and how nginx handles
+delegated Kerberos credentials.  It accepts four values:
 
-Constrained delegation (S4U2Proxy) can be enabled with the
-`auth_gss_constrained_delegation` directive alongside `auth_gss_delegate_credentials`.
-The service principal's TGT is held in a per-worker in-memory ccache (see the
-Service Ccache section below).
+* `off` (default): credentials are neither captured nor used.
+* `unconstrained`: capture the client's forwarded TGT when the client sets
+  the `GSS_C_DELEG_FLAG` in its SPNEGO token (i.e. the client opts in to
+  delegation).  The credential is stored in a temporary per-request ccache
+  file (destroyed once the request completes) and exposed via the
+  `$krb5_cc_name` nginx variable.  It can also be passed to a backend
+  in-memory via the `$krb5_cred_exported` nginx variable, which
+  base64-encodes the credential on demand using `gss_export_cred()` without
+  exposing the ccache path.
+* `constrained`: perform S4U2Proxy (constrained delegation).  The service
+  principal's TGT is held in a per-worker in-memory ccache (see the Service
+  Ccache section below) and used to obtain a service ticket impersonating
+  the authenticated user.
+* `both`: perform both unconstrained and constrained delegation.
 
-    auth_gss_delegate_credentials on;
-    auth_gss_constrained_delegation on;
+Example — unconstrained delegation, passing the ccache path to a FastCGI backend:
+
+    auth_gss_delegation unconstrained;
     fastcgi_param KRB5CCNAME $krb5_cc_name;
 
-To pass the credential to the backend in-memory rather than exposing the ccache path:
+Example — unconstrained delegation, passing the credential blob in-memory:
 
-    auth_gss_delegate_credentials on;
+    auth_gss_delegation unconstrained;
     fastcgi_param KRB5_EXPORTED_CRED $krb5_exported_cred;
+
+Example — constrained delegation (S4U2Proxy):
+
+    auth_gss_delegation constrained;
+    fastcgi_param KRB5CCNAME $krb5_cc_name;
 
 Constrained delegation requires a GSSAPI library that supports
 `gss_acquire_cred_from()` and `gss_store_cred_into()` (MIT Kerberos; planned
@@ -354,6 +366,7 @@ Important Changes
 
 * `$krb5_exported_cred`: new nginx variable to pass delegated Kerberos credentials in-memory to backends without writing a ccache file.
 * Constrained delegation service TGT is now held in a per-worker in-memory ccache; the `auth_gss_service_ccache` file-based directive has been removed.
+* **Breaking change**: `auth_gss_delegate_credentials` and `auth_gss_constrained_delegation` replaced by `auth_gss_delegation` accepting `off`, `unconstrained`, `constrained`, or `both`.
 
 
 Help
