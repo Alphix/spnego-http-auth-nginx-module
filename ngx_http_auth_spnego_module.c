@@ -77,6 +77,12 @@ typedef long _off_t;
 #define spnego_free_unparsed_name(ctx, s) krb5_free_unparsed_name(ctx, s)
 #endif
 
+/* Values for the auth_gss_delegation directive (bit-flags). */
+#define SPNEGO_DELEG_OFF           0
+#define SPNEGO_DELEG_CONSTRAINED   1
+#define SPNEGO_DELEG_UNCONSTRAINED 2
+#define SPNEGO_DELEG_BOTH          3
+
 #define spnego_log_krb5_error(context, code)                                   \
     {                                                                          \
         const char *___kerror = krb5_get_error_message(context, code);         \
@@ -181,9 +187,8 @@ typedef struct ngx_http_auth_spnego_loc_conf_s {
     ngx_array_t *auth_princs_regex;   /* regexes matching authorized principals */
 #endif
     ngx_flag_t map_to_local;          /* map principal to local name via gss_localname() */
-    ngx_flag_t delegate_credentials;  /* enable credential delegation */
-    ngx_flag_t constrained_delegation; /* use S4U2Proxy constrained delegation */
-    gss_cred_id_t constrained_creds;  /* service principal credential */
+    ngx_uint_t delegation;            /* SPNEGO_DELEG_* */
+    gss_cred_id_t constrained_creds;  /* service TGT for S4U2Proxy */
     ngx_uint_t channel_binding;       /* NGX_HTTP_AUTH_SPNEGO_CB_* */
 } ngx_http_auth_spnego_loc_conf_t;
 
@@ -213,6 +218,14 @@ static const ngx_conf_enum_t ngx_http_auth_spnego_cb[] = {
     { ngx_string("server-end-point"), NGX_HTTP_AUTH_SPNEGO_CB_SERVER_EP },
     { ngx_string("exporter"),         NGX_HTTP_AUTH_SPNEGO_CB_EXPORTER },
 #endif
+    { ngx_null_string, 0 }
+};
+
+static const ngx_conf_enum_t ngx_http_auth_spnego_delegation_enum[] = {
+    { ngx_string("off"),           SPNEGO_DELEG_OFF },
+    { ngx_string("constrained"),   SPNEGO_DELEG_CONSTRAINED },
+    { ngx_string("unconstrained"), SPNEGO_DELEG_UNCONSTRAINED },
+    { ngx_string("both"),          SPNEGO_DELEG_BOTH },
     { ngx_null_string, 0 }
 };
 
@@ -260,13 +273,12 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
      ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, map_to_local), NULL},
 
-    {ngx_string("auth_gss_delegate_credentials"), SPNEGO_NGX_CONF_FLAGS,
-     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
-     offsetof(ngx_http_auth_spnego_loc_conf_t, delegate_credentials), NULL},
-
-    {ngx_string("auth_gss_constrained_delegation"), SPNEGO_NGX_CONF_FLAGS,
-     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
-     offsetof(ngx_http_auth_spnego_loc_conf_t, constrained_delegation), NULL},
+    {ngx_string("auth_gss_delegation"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF
+         | NGX_HTTP_LMT_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_enum_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_auth_spnego_loc_conf_t, delegation),
+     (void *) &ngx_http_auth_spnego_delegation_enum},
 
     {ngx_string("auth_gss_channel_binding"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF
@@ -375,8 +387,7 @@ static void *ngx_http_auth_spnego_create_loc_conf(ngx_conf_t *cf) {
     conf->auth_princs_regex = NGX_CONF_UNSET_PTR;
 #endif
     conf->map_to_local = NGX_CONF_UNSET;
-    conf->delegate_credentials = NGX_CONF_UNSET;
-    conf->constrained_delegation = NGX_CONF_UNSET;
+    conf->delegation = NGX_CONF_UNSET_UINT;
     conf->constrained_creds = GSS_C_NO_CREDENTIAL;
     conf->channel_binding = NGX_CONF_UNSET_UINT;
 
@@ -501,13 +512,19 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
     ngx_conf_merge_off_value(conf->map_to_local, prev->map_to_local, 0);
 
-    ngx_conf_merge_off_value(conf->delegate_credentials,
-                             prev->delegate_credentials, 0);
-    ngx_conf_merge_off_value(conf->constrained_delegation,
-                             prev->constrained_delegation, 0);
+    ngx_conf_merge_uint_value(conf->delegation, prev->delegation,
+                              SPNEGO_DELEG_OFF);
     ngx_conf_merge_uint_value(conf->channel_binding,
                               prev->channel_binding,
                               NGX_HTTP_AUTH_SPNEGO_CB_OFF);
+#ifndef NGX_HTTP_AUTH_SPNEGO_HAVE_CB_FLAG
+    if (conf->channel_binding != NGX_HTTP_AUTH_SPNEGO_CB_OFF) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "auth_gss_channel_binding is not supported: "
+                           "the GSSAPI library lacks GSS_C_CHANNEL_BOUND_FLAG");
+        return NGX_CONF_ERROR;
+    }
+#endif
 #if (NGX_DEBUG)
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "auth_spnego: protect = %i",
                        conf->protect);
@@ -551,12 +568,8 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
                        conf->map_to_local);
 
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
-                       "auth_spnego: delegate_credentials = %i",
-                       conf->delegate_credentials);
-
-    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
-                       "auth_spnego: constrained_delegation = %i",
-                       conf->constrained_delegation);
+                       "auth_spnego: delegation = %ui",
+                       conf->delegation);
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0,
                        "auth_spnego: channel_binding = %ui",
                        conf->channel_binding);
@@ -1482,7 +1495,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         spnego_error(NGX_ERROR);
     }
 
-    if (alcf->delegate_credentials) {
+    if (alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED) {
         creds_info delegated_creds = {&creds, TYPE_KRB5_CREDS};
         if (ngx_http_auth_spnego_store_delegated_creds(r, name,
                                                        delegated_creds) != NGX_OK) {
@@ -1762,7 +1775,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         }
     }
 
-    if (alcf->constrained_delegation && my_gss_name != GSS_C_NO_NAME) {
+    if ((alcf->delegation & SPNEGO_DELEG_CONSTRAINED) && my_gss_name != GSS_C_NO_NAME) {
         OM_uint32 lifetime = 0;
 
         if (alcf->constrained_creds != GSS_C_NO_CREDENTIAL) {
@@ -1775,6 +1788,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 
         if (lifetime < RENEWAL_TIME) {
             gss_cred_id_t old_creds = alcf->constrained_creds;
+#if !(NGX_HAVE_HEIMDAL_GSSAPI)
             gss_key_value_element_desc elements[2];
             gss_key_value_set_desc store;
 
@@ -1797,6 +1811,19 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
                                  alcf->keytab_prefix_path);
                 spnego_error(NGX_ERROR);
             }
+#else
+            major_status = gss_acquire_cred(
+                &minor_status, my_gss_name, GSS_C_INDEFINITE,
+                GSS_C_NO_OID_SET, GSS_C_BOTH,
+                &alcf->constrained_creds, NULL, NULL);
+            if (GSS_ERROR(major_status)) {
+                alcf->constrained_creds = old_creds;
+                spnego_log_error("%s",
+                                 get_gss_error(r->pool, minor_status,
+                                               "gss_acquire_cred() failed"));
+                spnego_error(NGX_ERROR);
+            }
+#endif
 
             if (old_creds != GSS_C_NO_CREDENTIAL) {
                 gss_release_cred(&minor_status, &old_creds);
@@ -1813,6 +1840,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 
         my_gss_creds = alcf->constrained_creds;
     } else {
+#if !(NGX_HAVE_HEIMDAL_GSSAPI)
         gss_key_value_element_desc elements[1];
         gss_key_value_set_desc store;
 
@@ -1831,6 +1859,17 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
                              alcf->keytab_prefix_path);
             spnego_error(NGX_ERROR);
         }
+#else
+        major_status = gss_acquire_cred(
+            &minor_status, my_gss_name, GSS_C_INDEFINITE,
+            GSS_C_NO_OID_SET, GSS_C_ACCEPT, &my_gss_creds, NULL, NULL);
+        if (GSS_ERROR(major_status)) {
+            spnego_log_error("%s",
+                             get_gss_error(r->pool, minor_status,
+                                           "gss_acquire_cred() failed"));
+            spnego_error(NGX_ERROR);
+        }
+#endif
     }
 
     input_token.length = ctx->token.len;
@@ -1926,7 +1965,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         ngx_memcpy(username, output_token.value, output_token.length);
         username[output_token.length] = '\0';
 
-        if (alcf->delegate_credentials) {
+        if (alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED) {
             creds_info creds = {delegated_creds, TYPE_GSS_CRED_ID_T};
             if (ngx_http_auth_spnego_store_delegated_creds(r, username,
                                                            creds) != NGX_OK) {
@@ -2010,14 +2049,13 @@ ngx_http_auth_spnego_same_auth(ngx_http_auth_spnego_ctx_t *ctx,
                                ngx_http_auth_spnego_loc_conf_t *b) {
     ngx_http_auth_spnego_loc_conf_t *a = ctx->alcf;
 
-    if (a->fqun                      != b->fqun
-        || a->force_realm            != b->force_realm
-        || a->map_to_local           != b->map_to_local
+    if (a->fqun               != b->fqun
+        || a->force_realm     != b->force_realm
+        || a->map_to_local    != b->map_to_local
         || !ngx_http_auth_spnego_same_string(&a->realm, &b->realm)
         || !ngx_http_auth_spnego_same_string(&a->keytab, &b->keytab)
-        || a->channel_binding        != b->channel_binding
-        || a->delegate_credentials   != b->delegate_credentials
-        || a->constrained_delegation != b->constrained_delegation) {
+        || a->channel_binding != b->channel_binding
+        || a->delegation      != b->delegation) {
         return false;
     }
 
