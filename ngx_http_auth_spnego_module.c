@@ -55,6 +55,7 @@
 #define CCACHE_VARIABLE_NAME "krb5_cc_name"
 #define CRED_EXPORT_VARIABLE_NAME "krb5_exported_cred"
 #define SESSION_PRINCIPAL_VARIABLE_NAME "krb5_session_principal"
+#define AUTH_TYPE_VARIABLE_NAME "krb5_auth_type"
 #define RENEWAL_TIME 60
 #define BASIC_AUTH_TKT_LIFE 60  /* 1 minute; credential is discarded after password verification */
 
@@ -1064,7 +1065,7 @@ static ngx_int_t ngx_http_auth_spnego_set_variable(ngx_http_request_t *r,
         v->data = value->data;
         v->valid = 1;
         v->not_found = 0;
-        v->no_cacheable = 1;
+        v->no_cacheable = 0;
 
         return NGX_OK;
     }
@@ -1086,7 +1087,7 @@ static ngx_int_t ngx_http_auth_spnego_add_variable(ngx_conf_t *cf,
                                                    ngx_str_t *name,
                                                    ngx_http_get_variable_pt get) {
     ngx_http_variable_t *var =
-        ngx_http_add_variable(cf, name, NGX_HTTP_VAR_NOCACHEABLE);
+        ngx_http_add_variable(cf, name, 0);
 
     if (var == NULL) {
         return NGX_ERROR;
@@ -1094,6 +1095,18 @@ static ngx_int_t ngx_http_auth_spnego_add_variable(ngx_conf_t *cf,
 
     var->get_handler = get;
     var->data = 0;
+
+    /*
+     * Index the variable so ngx_http_get_variable() uses r->variables[index]
+     * (a stable, zero-initialized per-request slot) rather than allocating a
+     * fresh ngx_http_variable_value_t via ngx_palloc() on each call.  Without
+     * this, set_variable() and the Lua ngx.var accessor each receive a
+     * different, uninitialized vv pointer: the Lua read sees heap garbage from
+     * recycled pool memory and lj_str_new() crashes on the bogus length.
+     */
+    if (ngx_http_get_variable_index(cf, name) == NGX_ERROR) {
+        return NGX_ERROR;
+    }
 
     return NGX_OK;
 }
@@ -1133,6 +1146,13 @@ static ngx_int_t ngx_http_auth_spnego_init(ngx_conf_t *cf) {
 
     ngx_str_t session_principal_var = ngx_string(SESSION_PRINCIPAL_VARIABLE_NAME);
     if (ngx_http_auth_spnego_add_variable(cf, &session_principal_var,
+                                          ngx_http_auth_spnego_get_plain_handler)
+        != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    ngx_str_t auth_type_var = ngx_string(AUTH_TYPE_VARIABLE_NAME);
+    if (ngx_http_auth_spnego_add_variable(cf, &auth_type_var,
                                           ngx_http_auth_spnego_get_plain_handler)
         != NGX_OK) {
         return NGX_ERROR;
@@ -2443,6 +2463,12 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
 
     spnego_debug0("ngx_http_auth_spnego_basic: returning NGX_OK");
 
+    {
+        ngx_str_t at_var = ngx_string(AUTH_TYPE_VARIABLE_NAME);
+        ngx_str_t at_val = ngx_string("basic");
+        ngx_http_auth_spnego_set_variable(r, &at_var, &at_val);
+    }
+
 #if (NGX_HTTP_SSL)
     {
         uint8_t bh[32];
@@ -2945,6 +2971,12 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     gss_release_buffer(&minor_status, &output_token);
     output_token = (gss_buffer_desc)GSS_C_EMPTY_BUFFER;
 
+    {
+        ngx_str_t at_var = ngx_string(AUTH_TYPE_VARIABLE_NAME);
+        ngx_str_t at_val = ngx_string("spnego");
+        ngx_http_auth_spnego_set_variable(r, &at_var, &at_val);
+    }
+
     ret = NGX_OK;
     goto end;
 
@@ -3422,6 +3454,13 @@ ngx_http_auth_spnego_authenticate(ngx_http_request_t *r,
 
                 spnego_debug1("Session cookie auth succeeded for %s",
                               sess->username);
+
+                {
+                    ngx_str_t at_var = ngx_string(AUTH_TYPE_VARIABLE_NAME);
+                    ngx_str_t at_val = ngx_string("cookie");
+                    ngx_http_auth_spnego_set_variable(r, &at_var, &at_val);
+                }
+
                 return (ctx->ret = NGX_OK);
             }
             spnego_debug0("Session cookie present but invalid/expired");
