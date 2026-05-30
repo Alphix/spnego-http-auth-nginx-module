@@ -503,6 +503,7 @@ Important Changes
 * Session cookie support: new `auth_gss_session_key`, `auth_gss_session_expiry`, and related directives; `$krb5_session_principal` variable for cookie-authenticated requests.
 * New `$krb5_auth_type` variable reports how a request was authenticated: `spnego`, `basic`, or `cookie`.
 * `contrib/ldap_authz.lua`: example Lua script for LDAP group authorization after SPNEGO authentication.
+* Constrained delegation (S4U2Proxy) now works on the HTTP Basic authentication fallback path.
 
 
 Help

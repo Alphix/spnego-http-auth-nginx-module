@@ -191,8 +191,8 @@ typedef struct ngx_http_auth_spnego_loc_conf_s {
 #endif
     ngx_flag_t map_to_local;          /* map principal to local name via gss_localname() */
     ngx_uint_t delegation;            /* SPNEGO_DELEG_* */
-    ngx_str_t deleg_ccache_dir;       /* dir for NFS-backed delegation ccaches */
 #ifdef NGX_HAVE_CRED_STORE
+    ngx_str_t deleg_ccache_dir;       /* dir for NFS-backed delegation ccaches */
     gss_cred_id_t constrained_creds;  /* service TGT for S4U2Proxy */
 #endif
     ngx_uint_t channel_binding;       /* NGX_HTTP_AUTH_SPNEGO_CB_* */
@@ -309,10 +309,12 @@ static ngx_command_t ngx_http_auth_spnego_commands[] = {
      offsetof(ngx_http_auth_spnego_loc_conf_t, channel_binding),
      (void *) &ngx_http_auth_spnego_cb},
 
+#ifdef NGX_HAVE_CRED_STORE
     {ngx_string("auth_gss_deleg_ccache_dir"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_auth_spnego_loc_conf_t, deleg_ccache_dir), NULL},
+#endif
 
     {ngx_string("auth_gss_session_key"), SPNEGO_NGX_CONF_FLAGS,
      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
@@ -594,6 +596,7 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
     ngx_conf_merge_uint_value(conf->delegation, prev->delegation,
                               SPNEGO_DELEG_OFF);
+#ifdef NGX_HAVE_CRED_STORE
     ngx_conf_merge_str_value(conf->deleg_ccache_dir, prev->deleg_ccache_dir, "");
 
     if (conf->delegation != SPNEGO_DELEG_OFF
@@ -624,6 +627,14 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
             return NGX_CONF_ERROR;
         }
     }
+#else
+    if (conf->delegation != SPNEGO_DELEG_OFF) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "auth_gss_delegation requires gss_acquire_cred_from() "
+                           "and gss_store_cred_into() which are not available");
+        return NGX_CONF_ERROR;
+    }
+#endif
 
 
     ngx_conf_merge_uint_value(conf->channel_binding,
@@ -2158,6 +2169,12 @@ ngx_http_auth_spnego_set_session_cookie(ngx_http_request_t *r,
 }
 #endif /* NGX_HTTP_SSL */
 
+#ifdef NGX_HAVE_CRED_STORE
+static ngx_int_t ngx_http_auth_spnego_ensure_constrained_creds(
+    ngx_http_request_t *r, ngx_http_auth_spnego_loc_conf_t *alcf,
+    gss_name_t svc_name);
+#endif
+
 
 ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
                                      ngx_http_auth_spnego_ctx_t *ctx,
@@ -2172,7 +2189,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     gss_name_t    service_name   = GSS_C_NO_NAME;
     gss_name_t    src_name       = GSS_C_NO_NAME;
     gss_cred_id_t user_cred      = GSS_C_NO_CREDENTIAL;
-    gss_cred_id_t svc_cred       = GSS_C_NO_CREDENTIAL;
+    gss_cred_id_t acceptor_cred  = GSS_C_NO_CREDENTIAL;
     gss_cred_id_t delegated_cred = GSS_C_NO_CREDENTIAL;
     gss_ctx_id_t  init_ctx       = GSS_C_NO_CONTEXT;
     gss_ctx_id_t  accept_ctx     = GSS_C_NO_CONTEXT;
@@ -2327,7 +2344,16 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         spnego_error(NGX_DECLINED);
     }
 
-    /* Acquire the service (acceptor) credential from the keytab */
+    /* Acquire or reuse the acceptor credential */
+#ifdef NGX_HAVE_CRED_STORE
+    if (alcf->delegation & SPNEGO_DELEG_CONSTRAINED) {
+        if (ngx_http_auth_spnego_ensure_constrained_creds(r, alcf,
+                                                           service_name) != NGX_OK) {
+            spnego_error(NGX_ERROR);
+        }
+        acceptor_cred = alcf->constrained_creds;
+    } else
+#endif
     {
 #ifdef NGX_HAVE_GSS_ACQUIRE_CRED_FROM
         gss_key_value_element_desc elem;
@@ -2341,7 +2367,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         major_status = gss_acquire_cred_from(&minor_status, service_name,
                                               GSS_C_INDEFINITE,
                                               GSS_C_NO_OID_SET, GSS_C_ACCEPT,
-                                              &store, &svc_cred, NULL, NULL);
+                                              &store, &acceptor_cred, NULL, NULL);
 #else
         /* No gss_acquire_cred_from() (Heimdal 7.x): fall back to the default
          * acceptor credential.  auth_gss_keytab cannot be honored on this
@@ -2350,23 +2376,25 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         major_status = gss_acquire_cred(&minor_status, service_name,
                                         GSS_C_INDEFINITE,
                                         GSS_C_NO_OID_SET, GSS_C_ACCEPT,
-                                        &svc_cred, NULL, NULL);
+                                        &acceptor_cred, NULL, NULL);
 #endif
-    }
-    if (GSS_ERROR(major_status)) {
-        spnego_log_error("Cannot acquire service credential from %s: %s",
-                         alcf->keytab_prefix_path,
-                         get_gss_error(r->pool, minor_status,
-                                       "failed to acquire acceptor credential"));
-        spnego_error(NGX_ERROR);
+        if (GSS_ERROR(major_status)) {
+            spnego_log_error("Cannot acquire service credential from %s: %s",
+                             alcf->keytab_prefix_path,
+                             get_gss_error(r->pool, minor_status,
+                                           "failed to acquire acceptor credential"));
+            spnego_error(NGX_ERROR);
+        }
     }
 
     /* Synthetic init/accept loop: verifies the TGT against the keytab and
      * produces a delegated_cred if GSS_C_DELEG_FLAG is requested. */
     {
         OM_uint32 req_flags = GSS_C_MUTUAL_FLAG;
+#ifdef NGX_HAVE_CRED_STORE
         if (alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED)
             req_flags |= GSS_C_DELEG_FLAG;
+#endif
 
         major_status = gss_init_sec_context(&minor_status, user_cred, &init_ctx,
                                             service_name, GSS_C_NO_OID,
@@ -2383,7 +2411,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
 
         time_rec = GSS_C_INDEFINITE;
         major_status = gss_accept_sec_context(&minor_status, &accept_ctx,
-                                              svc_cred, &token,
+                                              acceptor_cred, &token,
                                               GSS_C_NO_CHANNEL_BINDINGS,
                                               &src_name, NULL, &reply,
                                               NULL, &time_rec, &delegated_cred);
@@ -2429,7 +2457,8 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     }
 
 
-    if ((alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED)
+#ifdef NGX_HAVE_CRED_STORE
+    if (alcf->delegation != SPNEGO_DELEG_OFF
         && delegated_cred != GSS_C_NO_CREDENTIAL) {
         if (ngx_http_auth_spnego_store_delegated_creds(r, name,
                                                        delegated_cred,
@@ -2437,6 +2466,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
             spnego_error(NGX_ERROR);
         }
     }
+#endif
 
     /* Append Kerberos realm to $remote_user if not already present */
     if (alcf->fqun &&
@@ -2497,8 +2527,12 @@ end:
         gss_release_cred(&minor_status, &delegated_cred);
     if (user_cred != GSS_C_NO_CREDENTIAL)
         gss_release_cred(&minor_status, &user_cred);
-    if (svc_cred != GSS_C_NO_CREDENTIAL)
-        gss_release_cred(&minor_status, &svc_cred);
+    if (acceptor_cred != GSS_C_NO_CREDENTIAL
+#ifdef NGX_HAVE_CRED_STORE
+        && acceptor_cred != alcf->constrained_creds
+#endif
+        )
+        gss_release_cred(&minor_status, &acceptor_cred);
     if (client_name != GSS_C_NO_NAME)
         gss_release_name(&minor_status, &client_name);
     if (service_name != GSS_C_NO_NAME)
@@ -2608,6 +2642,59 @@ ngx_http_auth_spnego_release_constrained_creds(void *data) {
     OM_uint32 minor_status;
     if (alcf->constrained_creds != GSS_C_NO_CREDENTIAL)
         gss_release_cred(&minor_status, &alcf->constrained_creds);
+}
+
+static ngx_int_t
+ngx_http_auth_spnego_ensure_constrained_creds(ngx_http_request_t *r,
+    ngx_http_auth_spnego_loc_conf_t *alcf, gss_name_t svc_name)
+{
+    OM_uint32 major_status, minor_status;
+    OM_uint32 lifetime = 0;
+
+    if (alcf->constrained_creds != GSS_C_NO_CREDENTIAL) {
+        major_status = gss_inquire_cred(&minor_status, alcf->constrained_creds,
+                                        NULL, &lifetime, NULL, NULL);
+        if (GSS_ERROR(major_status))
+            lifetime = 0;
+    }
+
+    if (lifetime < RENEWAL_TIME) {
+        gss_cred_id_t old_creds = alcf->constrained_creds;
+        gss_key_value_element_desc elements[2];
+        gss_key_value_set_desc store;
+
+        elements[0].key   = "keytab";
+        elements[0].value = alcf->keytab_prefix_path;
+        elements[1].key   = "client_keytab";
+        elements[1].value = alcf->keytab_prefix_path;
+        store.count    = 2;
+        store.elements = elements;
+
+        major_status = gss_acquire_cred_from(
+            &minor_status, svc_name, GSS_C_INDEFINITE,
+            GSS_C_NO_OID_SET, GSS_C_BOTH, &store,
+            &alcf->constrained_creds, NULL, NULL);
+        if (GSS_ERROR(major_status)) {
+            alcf->constrained_creds = old_creds;
+            spnego_log_error("%s Used keytab: %s",
+                             get_gss_error(r->pool, minor_status,
+                                           "gss_acquire_cred_from() failed"),
+                             alcf->keytab_prefix_path);
+            return NGX_ERROR;
+        }
+
+        if (old_creds != GSS_C_NO_CREDENTIAL) {
+            gss_release_cred(&minor_status, &old_creds);
+        } else {
+            ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(ngx_cycle->pool, 0);
+            if (cln == NULL)
+                return NGX_ERROR;
+            cln->handler = ngx_http_auth_spnego_release_constrained_creds;
+            cln->data    = alcf;
+        }
+    }
+
+    return NGX_OK;
 }
 #endif /* NGX_HAVE_CRED_STORE */
 
@@ -2762,54 +2849,9 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 
 #ifdef NGX_HAVE_CRED_STORE
     if ((alcf->delegation & SPNEGO_DELEG_CONSTRAINED) && my_gss_name != GSS_C_NO_NAME) {
-        OM_uint32 lifetime = 0;
-
-        if (alcf->constrained_creds != GSS_C_NO_CREDENTIAL) {
-            major_status = gss_inquire_cred(&minor_status,
-                                            alcf->constrained_creds,
-                                            NULL, &lifetime, NULL, NULL);
-            if (GSS_ERROR(major_status))
-                lifetime = 0;
+        if (ngx_http_auth_spnego_ensure_constrained_creds(r, alcf, my_gss_name) != NGX_OK) {
+            spnego_error(NGX_ERROR);
         }
-
-        if (lifetime < RENEWAL_TIME) {
-            gss_cred_id_t old_creds = alcf->constrained_creds;
-            gss_key_value_element_desc elements[2];
-            gss_key_value_set_desc store;
-
-            elements[0].key   = "keytab";
-            elements[0].value = alcf->keytab_prefix_path;
-            elements[1].key   = "client_keytab";
-            elements[1].value = alcf->keytab_prefix_path;
-            store.count    = 2;
-            store.elements = elements;
-
-            major_status = gss_acquire_cred_from(
-                &minor_status, my_gss_name, GSS_C_INDEFINITE,
-                GSS_C_NO_OID_SET, GSS_C_BOTH, &store,
-                &alcf->constrained_creds, NULL, NULL);
-            if (GSS_ERROR(major_status)) {
-                alcf->constrained_creds = old_creds;
-                spnego_log_error("%s Used keytab: %s",
-                                 get_gss_error(r->pool, minor_status,
-                                               "gss_acquire_cred_from() failed"),
-                                 alcf->keytab_prefix_path);
-                spnego_error(NGX_ERROR);
-            }
-
-            if (old_creds != GSS_C_NO_CREDENTIAL) {
-                gss_release_cred(&minor_status, &old_creds);
-            } else {
-                ngx_pool_cleanup_t *cln;
-                cln = ngx_pool_cleanup_add(ngx_cycle->pool, 0);
-                if (cln == NULL) {
-                    spnego_error(NGX_ERROR);
-                }
-                cln->handler = ngx_http_auth_spnego_release_constrained_creds;
-                cln->data    = alcf;
-            }
-        }
-
         my_gss_creds = alcf->constrained_creds;
     } else
 #endif /* NGX_HAVE_CRED_STORE */
@@ -2942,7 +2984,8 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         ngx_memcpy(username, output_token.value, output_token.length);
         username[output_token.length] = '\0';
 
-        if ((alcf->delegation & SPNEGO_DELEG_UNCONSTRAINED)
+#ifdef NGX_HAVE_CRED_STORE
+        if (alcf->delegation != SPNEGO_DELEG_OFF
             && delegated_creds != GSS_C_NO_CREDENTIAL) {
             if (ngx_http_auth_spnego_store_delegated_creds(r, username,
                                                            delegated_creds,
@@ -2950,6 +2993,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
                 spnego_error(NGX_ERROR);
             }
         }
+#endif
 
         r->headers_in.user.data = (u_char *)username;
         r->headers_in.user.len = output_token.length;
