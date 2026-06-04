@@ -126,22 +126,34 @@ ngx_http_auth_spnego_hex_decode(const u_char *hex, uint8_t *out, size_t n)
 }
 
 
-
-static const char *get_gss_error(ngx_pool_t *p, OM_uint32 error_status, char *prefix) {
+static const char *get_gss_error(ngx_pool_t *p, OM_uint32 major_status,
+                                  OM_uint32 minor_status, char *prefix) {
     OM_uint32 maj_stat, min_stat;
-    OM_uint32 msg_ctx = 0;
+    OM_uint32 msg_ctx;
     gss_buffer_desc status_string;
     char buf[1024];
     size_t len;
     ngx_str_t str;
     ngx_snprintf((u_char *)buf, sizeof(buf), "%s: %Z", prefix);
     len = ngx_strlen(buf);
+    msg_ctx = 0;
     do {
-        maj_stat = gss_display_status(&min_stat, error_status, GSS_C_MECH_CODE,
+        maj_stat = gss_display_status(&min_stat, major_status, GSS_C_GSS_CODE,
                                       GSS_C_NO_OID, &msg_ctx, &status_string);
         if (sizeof(buf) > len + status_string.length + 2) {
             ngx_snprintf((u_char *)buf + len, sizeof(buf) - len, "%*s:%Z",
-                         status_string.length, status_string.value);
+                         (size_t)status_string.length, status_string.value);
+            len += (status_string.length + 1);
+        }
+        gss_release_buffer(&min_stat, &status_string);
+    } while (!GSS_ERROR(maj_stat) && msg_ctx != 0);
+    msg_ctx = 0;
+    do {
+        maj_stat = gss_display_status(&min_stat, minor_status, GSS_C_MECH_CODE,
+                                      GSS_C_NO_OID, &msg_ctx, &status_string);
+        if (sizeof(buf) > len + status_string.length + 2) {
+            ngx_snprintf((u_char *)buf + len, sizeof(buf) - len, "%*s:%Z",
+                         (size_t)status_string.length, status_string.value);
             len += (status_string.length + 1);
         }
         gss_release_buffer(&min_stat, &status_string);
@@ -1562,7 +1574,7 @@ ngx_http_auth_spnego_store_delegated_creds(ngx_http_request_t *r,
                                            1, 0, &store, NULL, NULL);
     }
     if (GSS_ERROR(major_status)) {
-        spnego_log_error("%s", get_gss_error(r->pool, minor_status,
+        spnego_log_error("%s", get_gss_error(r->pool, major_status, minor_status,
                                              "gss_store_cred_into() failed"));
         return NGX_ERROR;
     }
@@ -2288,12 +2300,12 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         buf.value  = user.data;
         buf.length = user.len - 1; /* exclude NUL terminator */
         major_status = gss_import_name(&minor_status, &buf,
-                                       GSS_C_NO_OID,
+                                       GSS_C_NT_USER_NAME,
                                        &client_name);
         if (GSS_ERROR(major_status)) {
             spnego_log_error("Cannot import client name \"%s\": %s",
                              (const char *)user.data,
-                             get_gss_error(r->pool, minor_status,
+                             get_gss_error(r->pool, major_status, minor_status,
                                            "gss_import_name() failed"));
             spnego_error(NGX_ERROR);
         }
@@ -2308,7 +2320,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         if (GSS_ERROR(major_status)) {
             spnego_log_error("Cannot import service name \"%s\": %s",
                              alcf->service_principal,
-                             get_gss_error(r->pool, minor_status,
+                             get_gss_error(r->pool, major_status, minor_status,
                                            "gss_import_name() failed"));
             spnego_error(NGX_ERROR);
         }
@@ -2339,7 +2351,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     if (GSS_ERROR(major_status)) {
         spnego_log_error("Basic auth failed for \"%s\": %s",
                          (const char *)user.data,
-                         get_gss_error(r->pool, minor_status,
+                         get_gss_error(r->pool, major_status, minor_status,
                                        "gss_acquire_cred_with_password() failed"));
         spnego_error(NGX_DECLINED);
     }
@@ -2381,7 +2393,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
         if (GSS_ERROR(major_status)) {
             spnego_log_error("Cannot acquire service credential from %s: %s",
                              alcf->keytab_prefix_path,
-                             get_gss_error(r->pool, minor_status,
+                             get_gss_error(r->pool, major_status, minor_status,
                                            "failed to acquire acceptor credential"));
             spnego_error(NGX_ERROR);
         }
@@ -2404,7 +2416,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
                                             &token, NULL, NULL);
         if (GSS_ERROR(major_status)) {
             spnego_log_error("Basic auth gss_init_sec_context failed: %s",
-                             get_gss_error(r->pool, minor_status,
+                             get_gss_error(r->pool, major_status, minor_status,
                                            "gss_init_sec_context() failed"));
             spnego_error(NGX_ERROR);
         }
@@ -2422,7 +2434,7 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
             spnego_log_error("Basic auth credential verification failed "
                              "(keytab %s, service %s): %s",
                              alcf->keytab_prefix_path, alcf->service_principal,
-                             get_gss_error(r->pool, minor_status,
+                             get_gss_error(r->pool, major_status, minor_status,
                                            "gss_accept_sec_context() failed"));
             spnego_error(NGX_ERROR);
         }
@@ -2677,7 +2689,7 @@ ngx_http_auth_spnego_ensure_constrained_creds(ngx_http_request_t *r,
         if (GSS_ERROR(major_status)) {
             alcf->constrained_creds = old_creds;
             spnego_log_error("%s Used keytab: %s",
-                             get_gss_error(r->pool, minor_status,
+                             get_gss_error(r->pool, major_status, minor_status,
                                            "gss_acquire_cred_from() failed"),
                              alcf->keytab_prefix_path);
             return NGX_ERROR;
@@ -2840,7 +2852,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
                            &my_gss_name);
         if (GSS_ERROR(major_status)) {
             spnego_log_error("%s Used service principal: %s",
-                             get_gss_error(r->pool, minor_status,
+                             get_gss_error(r->pool, major_status, minor_status,
                                            "gss_import_name() failed"),
                              alcf->service_principal);
             spnego_error(NGX_ERROR);
@@ -2877,7 +2889,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
 #endif
         if (GSS_ERROR(major_status)) {
             spnego_log_error("%s Used keytab: %s",
-                             get_gss_error(r->pool, minor_status,
+                             get_gss_error(r->pool, major_status, minor_status,
                                            "failed to acquire acceptor credential"),
                              alcf->keytab_prefix_path);
             spnego_error(NGX_ERROR);
@@ -2910,7 +2922,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         &ret_flags, &time_rec, &delegated_creds);
 
     if (GSS_ERROR(major_status)) {
-        spnego_debug1("%s", get_gss_error(r->pool, minor_status,
+        spnego_debug1("%s", get_gss_error(r->pool, major_status, minor_status,
                                           "gss_accept_sec_context() failed"));
         spnego_error(NGX_DECLINED);
     }
@@ -2948,7 +2960,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
     major_status =
         gss_display_name(&minor_status, client_name, &output_token, NULL);
     if (GSS_ERROR(major_status)) {
-        spnego_log_error("%s", get_gss_error(r->pool, minor_status,
+        spnego_log_error("%s", get_gss_error(r->pool, major_status, minor_status,
                                              "gss_display_name() failed"));
         spnego_error(NGX_ERROR);
     }
@@ -2969,7 +2981,7 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         major_status = gss_localname(&minor_status, client_name, GSS_C_NO_OID,
                                      &output_token);
         if (GSS_ERROR(major_status)) {
-            spnego_log_error("%s", get_gss_error(r->pool, minor_status,
+            spnego_log_error("%s", get_gss_error(r->pool, major_status, minor_status,
                                                  "gss_localname() failed"));
             spnego_error(NGX_ERROR);
         }
