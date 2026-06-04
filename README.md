@@ -117,7 +117,7 @@ delegated Kerberos credentials.  It accepts four values:
   `auth_gss_deleg_ccache_dir`, named after the authenticated principal and
   overwritten on each successful delegation, and exposed via the
   `$krb5_cc_name` nginx variable.  It can also be passed to a backend
-  in-memory via the `$krb5_cred_exported` nginx variable, which
+  in-memory via the `$krb5_exported_cred` nginx variable, which
   base64-encodes the credential on demand using `gss_export_cred()` without
   exposing the ccache path.
 * `constrained`: perform S4U2Proxy (constrained delegation).  The service
@@ -504,6 +504,7 @@ Important Changes
 * New `$krb5_auth_type` variable reports how a request was authenticated: `spnego`, `basic`, or `cookie`.
 * `contrib/ldap_authz.lua`: example Lua script for LDAP group authorization after SPNEGO authentication.
 * Constrained delegation (S4U2Proxy) now works on the HTTP Basic authentication fallback path.
+* Authentication failures now report both GSS major and minor status codes in the nginx error log.
 
 
 Help
