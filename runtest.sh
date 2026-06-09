@@ -24,6 +24,11 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
 	libnginx-mod-http-lua luarocks cargo > /dev/null || exit 1
 echo "OK"
 
+printf "Installing PHP krb5 PECL extension build deps ... "
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+	--no-install-recommends php-dev autoconf > /dev/null || exit 1
+echo "OK"
+
 # lua-resty-ldap: the "merged" branch of Alphix's fork adds SASL/GSSAPI bind
 # support needed by contrib/ldap_authz.lua, which isn't in any released
 # version yet, so build and install it from a git checkout.
@@ -36,6 +41,10 @@ echo "OK"
 printf "Building and installing lua-resty-ldap ... "
 (cd /tmp/lua-resty-ldap \
 	&& sudo luarocks make rockspec/lua-resty-ldap-local-0.rockspec > /dev/null 2>&1) || exit 1
+echo "OK"
+
+printf "Installing pecl-authentication-krb5 ... "
+sudo pecl install krb5-1.3.0 > /dev/null 2>&1 || exit 1
 echo "OK"
 
 cd /usr/share/nginx/src
