@@ -608,6 +608,11 @@ else
 fi
 
 
+printf "Enabling pecl-authentication-krb5 ... "
+PHP_VER=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
+echo "extension=krb5.so" > "/etc/php/${PHP_VER}/fpm/conf.d/30-krb5.ini"
+echo "OK"
+
 
 # Session cookies need AES-256-GCM-SIV (OpenSSL 3.2 or later). Without it the
 # module must refuse to start when a session key is configured. Probe what this
@@ -718,11 +723,12 @@ server {
                 auth_gss_deleg_ccache_dir /var/lib/krb5_deleg_caches;
 	}
 
-	# Tests credential delegation: delegated credentials are written to a
-	# FILE ccache ($krb5_cc_name) and also lazily exported in-memory
-	# ($krb5_exported_cred).  No constrained delegation is configured here;
-	# the client forwards credentials directly because +ok_as_delegate is set
-	# on the HTTP principal and curl uses its default delegation policy.
+	# Tests in-memory credential export: KRB5_EXPORTED_CRED carries the
+	# gss_export_cred blob; KRB5CCNAME is intentionally not forwarded so
+	# that export_check.php must derive the ccache entirely from the blob.
+	# No constrained delegation is configured here; the client forwards
+	# credentials directly because +ok_as_delegate is set on the HTTP
+	# principal and curl uses its default delegation policy.
 	location /export_check.php {
 		include snippets/fastcgi-php.conf;
 		fastcgi_pass unix:/run/php/php-fpm.sock;
@@ -734,8 +740,8 @@ server {
                 auth_gss_authorized_principal alice@${KERBEROS_REALM};
                 auth_gss_format_full on;
                 fastcgi_param HTTP_AUTHORIZATION "";
+                fastcgi_param KRB5CCNAME "";
                 fastcgi_param KRB5_EXPORTED_CRED \$krb5_exported_cred;
-                fastcgi_param KRB5CCNAME \$krb5_cc_name;
                 auth_gss_delegation unconstrained;
                 auth_gss_deleg_ccache_dir /var/lib/krb5_deleg_caches;
 	}
@@ -1969,30 +1975,76 @@ printf "Writing luaauth.html static file ... "
 echo "Authorized" > /var/www/kerberos/luaauth.html && echo "OK" || die
 
 printf "Writing export_check.php ... "
-if ! cat <<'EOF' > /var/www/kerberos/export_check.php
+if ! cat <<EOF > /var/www/kerberos/export_check.php
 <?php
-	if (!isset($_SERVER["REMOTE_USER"]) || $_SERVER["REMOTE_USER"] == "") {
+	if (!isset(\$_SERVER["REMOTE_USER"]) || \$_SERVER["REMOTE_USER"] == "") {
 		http_response_code(500);
 		echo("REMOTE_USER not set");
 		exit();
 	}
-	if (!isset($_SERVER["KRB5_EXPORTED_CRED"]) || $_SERVER["KRB5_EXPORTED_CRED"] == "") {
+	if (!isset(\$_SERVER["KRB5_EXPORTED_CRED"]) || \$_SERVER["KRB5_EXPORTED_CRED"] == "") {
 		http_response_code(500);
 		echo("KRB5_EXPORTED_CRED not set");
 		exit();
 	}
-	if (!isset($_SERVER["KRB5CCNAME"]) || $_SERVER["KRB5CCNAME"] == "") {
+	// Validate that nginx did NOT inject a ready-made KRB5CCNAME; the point
+	// of this test is that the backend derives everything from the blob.
+	if (!empty(\$_SERVER["KRB5CCNAME"])) {
 		http_response_code(500);
-		echo("KRB5CCNAME not set");
+		echo("KRB5CCNAME must not be set for in-memory export test");
 		exit();
 	}
-	$blob = base64_decode($_SERVER["KRB5_EXPORTED_CRED"], true);
-	if ($blob === false || strlen($blob) == 0) {
+	\$blob = base64_decode(\$_SERVER["KRB5_EXPORTED_CRED"], true);
+	if (\$blob === false || strlen(\$blob) == 0) {
 		http_response_code(500);
 		echo("KRB5_EXPORTED_CRED is not valid base64");
 		exit();
 	}
-	echo("Export credentials valid for " . $_SERVER["REMOTE_USER"]);
+	if (!extension_loaded('krb5')) {
+		http_response_code(500);
+		echo("krb5 extension not loaded");
+		exit();
+	}
+	\$ctx = new GSSAPIContext();
+	if (!\$ctx->importCredentials(\$blob)) {
+		http_response_code(500);
+		echo("importCredentials() failed");
+		exit();
+	}
+	\$ccname = "MEMORY:export_check_" . getmypid();
+	if (!\$ctx->storeCredentials(\$ccname)) {
+		http_response_code(500);
+		echo("storeCredentials() failed");
+		exit();
+	}
+	putenv("KRB5CCNAME=" . \$ccname);
+	\$conn = ldap_connect("ldap://${TEST_HOST_FQDN}/");
+	if (!\$conn) {
+		http_response_code(500);
+		echo("ldap_connect() failed");
+		exit();
+	}
+	if (!ldap_set_option(\$conn, LDAP_OPT_PROTOCOL_VERSION, 3)) {
+		http_response_code(500);
+		echo("ldap_set_option() failed");
+		exit();
+	}
+	\$r = ldap_sasl_bind(\$conn);
+	if (!\$r) {
+		http_response_code(500);
+		echo("ldap_sasl_bind() failed: " . ldap_error(\$conn));
+		if (ldap_get_option(\$conn, LDAP_OPT_DIAGNOSTIC_MESSAGE, \$ext_err)) {
+			echo(" (" . \$ext_err . ")");
+		}
+		exit();
+	}
+	\$who = ldap_exop_whoami(\$conn);
+	if (!\$who) {
+		http_response_code(500);
+		echo("ldap_exop_whoami() failed");
+		exit();
+	}
+	echo(\$who);
 ?>
 EOF
 then
@@ -2400,17 +2452,17 @@ test_redirect_token()
 
 test_export_check()
 {
-	EXPORT_EXPECTED="Export credentials valid for ${1}@${KERBEROS_REALM}"
+	LDAP_EXPECTED="dn:uid=${1},cn=gss-spnego,cn=auth"
 
-	printf "Export credential blob valid for %s ... " "${1}"
+	printf "LDAP whoami via imported credential for %s ... " "${1}"
 	if [ -e "${CURL_OUTPUT}" ]; then
-		EXPORT_RESULT="$(cat "${CURL_OUTPUT}")"
-		if [ "${EXPORT_RESULT}" != "${EXPORT_EXPECTED}" ]; then
-			printf "%s != %s ... " "${EXPORT_RESULT}" "${EXPORT_EXPECTED}"
+		LDAP_WHOAMI="$(cat "${CURL_OUTPUT}")"
+		if [ "${LDAP_WHOAMI}" != "${LDAP_EXPECTED}" ]; then
+			printf "%s != %s ... " "${LDAP_WHOAMI}" "${LDAP_EXPECTED}"
 			EX=1
 			echo "FAILED"
 		else
-			printf "%s ... " "${EXPORT_RESULT}"
+			printf "%s ... " "${LDAP_WHOAMI}"
 			echo "OK"
 		fi
 	else

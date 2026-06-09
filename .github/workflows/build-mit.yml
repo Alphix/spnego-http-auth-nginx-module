@@ -34,6 +34,7 @@ jobs:
           sudo eatmydata apt-get install                                      \
             nginx nginx-dev build-essential libkrb5-dev curl                  \
             libnginx-mod-http-headers-more-filter                             \
+            autoconf php-dev                                                   \
             slapd ldap-utils                                                  \
             krb5-admin-server krb5-kdc krb5-kdc-ldap                          \
             libsasl2-modules-gssapi-mit                                       \
@@ -42,6 +43,9 @@ jobs:
 
       - name: Check out repository code
         uses: actions/checkout@v5
+
+      - name: Install pecl-authentication-krb5
+        run: sudo pecl install krb5-1.3.0
 
       - name: Clone, build and install lua-resty-ldap
         run: |
