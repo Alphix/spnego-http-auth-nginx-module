@@ -1060,6 +1060,10 @@ static ngx_int_t ngx_http_auth_spnego_get_handler(ngx_http_request_t *r,
     if (ctx != NULL && ctx->ccache.data != NULL) {
         v->len = ctx->ccache.len;
         v->data = ctx->ccache.data;
+    } else if (v != stored) {
+        /* nginx returns a cached not_found from indexed storage without
+         * calling the getter again, which would defeat the recheck below. */
+        v->not_found = 1;
     }
     if (v == stored) {
         /* Indexed reads must call the getter again after a redirect. */
@@ -1074,6 +1078,11 @@ static ngx_int_t ngx_http_auth_spnego_get_handler(ngx_http_request_t *r,
 static ngx_int_t ngx_http_auth_spnego_get_plain_handler(ngx_http_request_t *r,
                                                         ngx_http_variable_value_t *v,
                                                         uintptr_t data) {
+    /* ngx_http_auth_spnego_set_variable() fills these in once the variable
+     * has a value; until then, mark it as not found rather than leaving a
+     * zeroed (len=0, valid=0, not_found=0) value. */
+    v->not_found = 1;
+
     return NGX_OK;
 }
 
