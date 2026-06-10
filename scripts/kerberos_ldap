@@ -353,6 +353,10 @@ if ! cat <<EOF > /etc/krb5.conf
                 kdc = ${TEST_HOST_FQDN}
                 admin_server = ${TEST_HOST_FQDN}
                 default_domain = ${DOMAIN}
+                # Custom mapping for the auth_gss_map_to_local Basic-auth test:
+                # bob -> bobmapped, everything else uses the default mapping.
+                auth_to_local = RULE:[1:\$1](bob)s/bob/bobmapped/
+                auth_to_local = DEFAULT
         }
 EOF
 then
@@ -705,6 +709,22 @@ server {
                 auth_gss_format_full on;
                 fastcgi_param HTTP_AUTHORIZATION "";
                 fastcgi_param KRB5CCNAME \$krb5_cc_name;
+	}
+
+	# Basic-auth + auth_gss_map_to_local: $remote_user must come from the
+	# GSS-verified principal mapped via gss_localname() (krb5.conf maps
+	# bob -> bobmapped here), not the client-typed Basic auth username.
+	location /maptolocal.php {
+		include snippets/fastcgi-php.conf;
+		fastcgi_pass unix:/run/php/php-fpm.sock;
+                auth_gss on;
+                auth_gss_realm ${KERBEROS_REALM};
+                auth_gss_keytab /etc/krb5.http.keytab;
+                auth_gss_service_name HTTP/${TEST_HOST_FQDN};
+                auth_gss_allow_basic_fallback on;
+                auth_gss_map_to_local on;
+                auth_gss_authorized_principal bobmapped;
+                fastcgi_param HTTP_AUTHORIZATION "";
 	}
 
 	location /delegate.php {
@@ -1482,7 +1502,9 @@ $(delegation_settings alice)
 		}
 		location /redirect/basic-different/ {
 			auth_gss_allow_basic_fallback on;
-			auth_gss_authorized_principal bob@${KERBEROS_REALM};
+			# map_to_local also maps Basic logins (bob -> bobmapped), and the
+			# principal check uses the mapped name.
+			auth_gss_authorized_principal bobmapped@${KERBEROS_REALM};
 			auth_gss_map_to_local on;
 			index /fallback.php;
 		}
@@ -1813,6 +1835,23 @@ echo "OK"
 
 printf "Writing fallback.php ... "
 if ! cat <<'EOF' > /var/www/kerberos/fallback.php
+<?php
+	if (!isset($_SERVER["REMOTE_USER"]) || $_SERVER["REMOTE_USER"] == "") {
+		http_response_code(500);
+		echo("REMOTE_USER not set");
+		exit();
+	}
+	echo("Authenticated as " . $_SERVER["REMOTE_USER"]);
+?>
+EOF
+then
+	die
+fi
+echo "OK"
+
+
+printf "Writing maptolocal.php ... "
+if ! cat <<'EOF' > /var/www/kerberos/maptolocal.php
 <?php
 	if (!isset($_SERVER["REMOTE_USER"]) || $_SERVER["REMOTE_USER"] == "") {
 		http_response_code(500);
@@ -2849,6 +2888,22 @@ test_path "auth.php" 401 403
 test_path "delegate.php" 401 403
 test_path "export_check.php" 401 403
 test_path "luaauth.html" 401 403
+
+# auth_gss_map_to_local with Basic auth: $remote_user must come from
+# gss_localname() on the GSS-verified principal (bob -> bobmapped per the
+# auth_to_local rule above), not from the client-typed Basic auth username.
+echo ""
+echo "--- auth_gss_map_to_local with Basic auth (M1 regression test) ---"
+test_path "maptolocal.php" 401 200
+test_basic "maptolocal.php" 401 200
+printf "maptolocal.php basic auth REMOTE_USER (expect 'Authenticated as bobmapped') ... "
+if [ -e "${CURL_OUTPUT}" ] && [ "$(cat "${CURL_OUTPUT}")" = "Authenticated as bobmapped" ]; then
+	echo "OK"
+else
+	EX=1
+	echo "FAILED"
+	if [ -e "${CURL_OUTPUT}" ]; then cat "${CURL_OUTPUT}"; echo ""; fi
+fi
 
 echo ""
 printf "Adding bob to webusers group ... "

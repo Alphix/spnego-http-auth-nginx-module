@@ -2494,6 +2494,52 @@ ngx_int_t ngx_http_auth_spnego_basic(ngx_http_request_t *r,
     }
 #endif
 
+    /*
+     * Set $remote_user from the GSS-verified canonical principal
+     * (src_name), mirroring the SPNEGO path, instead of trusting the
+     * client-typed username. This also feeds auth_gss_authorized_principal
+     * below.
+     */
+    {
+        gss_buffer_desc local_buf = GSS_C_EMPTY_BUFFER;
+        ngx_str_t canon;
+
+        if (alcf->map_to_local) {
+            major_status = gss_localname(&minor_status, src_name,
+                                          GSS_C_NO_OID, &local_buf);
+            if (GSS_ERROR(major_status)) {
+                spnego_log_error("%s", get_gss_error(r->pool, major_status,
+                                     minor_status, "gss_localname() failed"));
+                spnego_error(NGX_DECLINED);
+            }
+            canon.data = local_buf.value;
+            canon.len  = local_buf.length;
+        } else {
+            canon.data = (u_char *) name;
+            canon.len  = ngx_strlen(name);
+        }
+
+        if (canon.len == 0) {
+            gss_release_buffer(&minor_status, &local_buf);
+            spnego_log_error("Cannot map \"%s\" to a local user name", name);
+            spnego_error(NGX_ERROR);
+        }
+
+        new_user.data = ngx_pnalloc(r->pool, canon.len);
+        if (new_user.data == NULL) {
+            gss_release_buffer(&minor_status, &local_buf);
+            spnego_log_error("Not enough memory");
+            spnego_error(NGX_ERROR);
+        }
+        ngx_memcpy(new_user.data, canon.data, canon.len);
+        new_user.len = canon.len;
+        gss_release_buffer(&minor_status, &local_buf);
+
+        r->headers_in.user.data = new_user.data;
+        r->headers_in.user.len  = new_user.len;
+    }
+    ngx_http_auth_spnego_strip_realm(r, alcf);
+
     /* Append Kerberos realm to $remote_user if not already present */
     if (alcf->fqun &&
         !ngx_http_auth_spnego_realm_from_str(r->headers_in.user, NULL)) {
