@@ -652,7 +652,6 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
 
     if (conf->deleg_ccache_dir.len > 0) {
         ngx_file_info_t fi;
-        char *dir = (char *)conf->deleg_ccache_dir.data;
         if (ngx_file_info(conf->deleg_ccache_dir.data, &fi) == NGX_FILE_ERROR
             || !ngx_is_dir(&fi))
         {
@@ -662,12 +661,16 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
                                &conf->deleg_ccache_dir);
             return NGX_CONF_ERROR;
         }
-        if (access(dir, W_OK | X_OK) != 0) {
+#if !(NGX_WIN32)
+        /* No portable nginx wrapper for this, and Windows uses ACLs; there
+         * a non-writable directory is only caught when storing a ccache. */
+        if (access((char *)conf->deleg_ccache_dir.data, W_OK | X_OK) != 0) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "auth_gss_deleg_ccache_dir \"%V\" is not "
                                "writable", &conf->deleg_ccache_dir);
             return NGX_CONF_ERROR;
         }
+#endif
     }
 #else
     if (conf->delegation != SPNEGO_DELEG_OFF) {
