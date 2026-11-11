@@ -32,7 +32,10 @@
 #include <ngx_http.h>
 
 #include <gssapi/gssapi.h>
+#if !(NGX_HAVE_HEIMDAL_GSSAPI)
+/* MIT only, Heimdal declares its GSSAPI extensions in gssapi.h */
 #include <gssapi/gssapi_ext.h>
+#endif
 #include <krb5.h>
 #include <stdbool.h>
 
@@ -69,6 +72,12 @@
 #define SPNEGO_DELEG_CONSTRAINED   1
 #define SPNEGO_DELEG_UNCONSTRAINED 2
 #define SPNEGO_DELEG_BOTH          3
+
+/* Heimdal < 8 lacks GSS_C_CHANNEL_BOUND_FLAG, so a successful
+ * gss_accept_sec_context() can't be checked for channel binding. */
+#ifdef GSS_C_CHANNEL_BOUND_FLAG
+#define NGX_HTTP_AUTH_SPNEGO_HAVE_CB_FLAG 1
+#endif
 
 
 #define spnego_error(code)                                                     \
@@ -666,6 +675,15 @@ static char *ngx_http_auth_spnego_merge_loc_conf(ngx_conf_t *cf, void *parent,
     ngx_conf_merge_uint_value(conf->channel_binding,
                               prev->channel_binding,
                               NGX_HTTP_AUTH_SPNEGO_CB_OFF);
+
+#ifndef NGX_HTTP_AUTH_SPNEGO_HAVE_CB_FLAG
+    if (conf->channel_binding != NGX_HTTP_AUTH_SPNEGO_CB_OFF) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "auth_gss_channel_binding is not supported: "
+                           "the GSSAPI library lacks GSS_C_CHANNEL_BOUND_FLAG");
+        return NGX_CONF_ERROR;
+    }
+#endif
     ngx_conf_merge_str_value(conf->session_key, prev->session_key, "");
     ngx_conf_merge_str_value(conf->session_key_file, prev->session_key_file, "");
     ngx_conf_merge_str_value(conf->session_cookie_name, prev->session_cookie_name,
@@ -3001,11 +3019,13 @@ ngx_http_auth_spnego_auth_user_gss(ngx_http_request_t *r,
         spnego_error(NGX_DECLINED);
     }
 
+#ifdef NGX_HTTP_AUTH_SPNEGO_HAVE_CB_FLAG
     if (alcf->channel_binding != NGX_HTTP_AUTH_SPNEGO_CB_OFF
         && !(ret_flags & GSS_C_CHANNEL_BOUND_FLAG)) {
         spnego_log_error("channel binding required but not provided by client");
         spnego_error(NGX_DECLINED);
     }
+#endif
 
     if (output_token.length) {
         spnego_token.data = (u_char *)output_token.value;
